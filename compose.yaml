@@ -1,0 +1,16 @@
+services:
+  searxng:
+    image: searxng/searxng:2026.11.13-219b63b20
+    container_name: internet-use-searxng
+    ports:
+      - "49731:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      SEARXNG_BASE_URL: http://localhost:49731/
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped

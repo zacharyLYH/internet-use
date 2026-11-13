@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "internet-use"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "uvicorn[standard]",
+    "beautifulsoup4",
+    "trafilatura",
+    "patchright",
+]
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
