@@ -1,5 +1,8 @@
 use_default_settings: true
 
+general:
+  contact_url: "mailto:searx@localhost"
+
 server:
   secret_key: "internet-use-dev-only-change-me"
   limiter: false
@@ -10,3 +13,20 @@ search:
   formats:
     - html
     - json
+
+engines:
+  - name: google
+    disabled: false
+    weight: 1.5
+  - name: duckduckgo
+    weight: 1.2
+  - name: brave
+    weight: 1.2
+  - name: bing
+    disabled: false
+    weight: 1.0
+  - name: qwant
+    disabled: false
+    weight: 1.0
+  - name: wikipedia
+    weight: 1.5

@@ -19,7 +19,7 @@ Each stage has a clear input and output contract. The initial design favors simp
 ### Module 1: SearXNG Search Client (`fetch_search_response`)
 
 - **Role:** Query the locally hosted SearXNG `/search` endpoint.
-- **Input:** `query` and optional `max_results`.
+- **Input:** `query`.
 - **Behavior:** Request JSON output and return the parsed response. SearXNG must have JSON output enabled; its configured engines determine the upstream search sources. DuckDuckGo can be enabled as one engine.
 - **Output:** `search_response` (structured JSON).
 
@@ -30,7 +30,9 @@ See [docs/module1.md](docs/module1.md) for the detailed contract.
 - **Role:** Convert SearXNG's response into consistent search hits.
 - **Input:** `search_response`, result limit, and optional domain denylist.
 - **Behavior:** Normalize title, URL, and snippet; remove invalid or duplicate URLs; apply the denylist; keep the requested number of hits.
-- **Output:** `List[SearchHit]`, each with `title`, `url`, and `snippet`.
+- **Output:** `List[SearchHit]`, each with `title`, `url`, `snippet`, `engines`, `category`, `score`, and `published`.
+
+See [docs/module2.md](docs/module2.md) for the detailed contract.
 
 ### Module 3: Target Page Scraper (`fetch_target_page`)
 

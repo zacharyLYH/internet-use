@@ -9,7 +9,6 @@ Query the locally hosted SearXNG service and return its structured search respon
 **Input**
 
 - `query`: required search text.
-- `max_results`: optional result limit for downstream processing.
 
 **Output**
 
@@ -24,7 +23,7 @@ Query the locally hosted SearXNG service and return its structured search respon
 
 SearXNG's JSON format must be enabled in its settings. Configure its enabled engines there; the application does not scrape an engine's HTML or depend on a particular provider's result-page markup.
 
-This module does not visit destination pages or extract article content. Those belong to later modules.
+This module does not visit destination pages or extract article content. Those belong to later modules. It also does not limit, deduplicate, or denylist results; those are Module 2's job.
 
 ## Failure handling
 
