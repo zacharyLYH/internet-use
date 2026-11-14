@@ -36,10 +36,12 @@ See [docs/module2.md](docs/module2.md) for the detailed contract.
 
 ### Module 3: Target Page Scraper (`fetch_target_page`)
 
-- **Role:** Load a destination page in a JavaScript-capable browser and return its rendered HTML.
+- **Role:** Load a destination page in a JavaScript-capable browser and return a bounded rendered snapshot.
 - **Input:** `url`.
-- **Behavior:** Use Patchright with a persistent local Chrome profile, navigate to the URL, wait for the page to settle, then return `page.content()`.
-- **Output:** `raw_page_html`.
+- **Behavior:** Use Patchright with a persistent local Chrome profile, block private and metadata destinations at the network boundary, navigate to the URL, wait for the DOM to settle, then capture the rendered HTML.
+- **Output:** `FetchOutcome` (`PageSnapshot` or `FetchFailure`) with the requested/final URLs, title, status, content type, HTML, render state, and warnings.
+
+See [docs/module3.md](docs/module3.md) for browser lifecycle, URL safety, rendering limits, and failure handling.
 
 ### Module 4: Content Cleaner (`clean_to_markdown`)
 
@@ -90,14 +92,15 @@ We want a small query-to-page pipeline with a persistent local browser session. 
 - **First-time setup (for LSP):** `make install`
 - **Dev:** `./scripts/dev-up.sh` — starts SearXNG, waits for it to be healthy, then runs the app on `127.0.0.1:8000`. `Ctrl+C` tears both down.
 - **Prod:** `RELOAD= ./scripts/dev-up.sh` — same thing, just no file watcher.
-- **Test:** `make test` — starts SearXNG if needed, runs mypy + unit tests + the live integration test, then tears down only what it started.
+- **Test:** `make test` — starts SearXNG if needed, runs mypy + unit/integration tests, then tears down only what it started. Browser integration tests use local fixtures with headless Chrome.
+- **Sign in to sites:** Stop the app, then run `make browser-profile`. This opens the persistent Chrome profile used by Module 3; close its windows when finished before starting the app again.
 - **Teardown:** `./scripts/dev-down.sh` (safe to run twice).
 
 ## 8. Sharp edges
 
-- The app has to run in a **GUI-enabled, logged-in macOS session**. Patchright drives headed Chrome, so SSH, CI, or a headless box won't work.
+- The production app has to run in a **GUI-enabled, logged-in macOS session**. Patchright drives headed Chrome, so SSH or a headless production box won't work. Tests use headless Chrome against local fixtures.
 - SearXNG lives in Docker; the app stays on the host.
 - Keep `json` enabled in `searxng/settings.yml`, or Module 1 gets a clean `SearchError`.
 - SearXNG is on `49731`, the app on `8000`. Change one and update `SEARXNG_URL` too.
 - `make stop` and `dev-down.sh` use `pkill`, so they'll take down other uvicorn processes too.
-- `tests/test_search.py` is mocked and offline. `tests/test_search_integration.py` calls live SearXNG; `make test` starts it for you.
+- `tests/test_search_unit.py` and `tests/test_parser_unit.py` are offline. The integration files call live SearXNG and local browser fixtures; `make test` starts what they need.

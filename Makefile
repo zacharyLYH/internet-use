@@ -3,8 +3,9 @@ PY := $(VENV)/bin/python
 PYTHON := python3.12
 SEARXNG_URL ?= http://localhost:49731
 RELOAD ?= --reload
+BROWSER_PROFILE_DIR ?= data/browser-profile
 
-.PHONY: install start stop test
+.PHONY: install start stop test browser-profile
 
 $(VENV):
 	$(PYTHON) -m venv $(VENV)
@@ -20,3 +21,6 @@ stop:
 
 test: install
 	./scripts/test.sh
+
+browser-profile: install
+	BROWSER_PROFILE_DIR="$(BROWSER_PROFILE_DIR)" $(PY) scripts/open_browser_profile.py
