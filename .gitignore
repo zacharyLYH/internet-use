@@ -6,3 +6,4 @@ __pycache__/
 .mypy_cache/
 uvicorn.pid
 data/browser-profile/
+data/api_keys.txt

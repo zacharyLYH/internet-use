@@ -30,7 +30,7 @@ See [docs/module1.md](docs/module1.md) for the detailed contract.
 - **Role:** Convert SearXNG's response into consistent search hits.
 - **Input:** `search_response`, result limit, and optional domain denylist.
 - **Behavior:** Normalize title, URL, and snippet; remove invalid or duplicate URLs; apply the denylist; keep the requested number of hits.
-- **Output:** `List[SearchHit]`, each with `title`, `url`, `snippet`, `engines`, `category`, `score`, and `published`.
+- **Output:** `List[SearchHit]` with normalized titles, URLs, snippets, and search metadata.
 
 See [docs/module2.md](docs/module2.md) for the detailed contract.
 
@@ -48,7 +48,15 @@ See [docs/module3.md](docs/module3.md) for browser lifecycle, URL safety, render
 - **Role:** Extract the main content and convert it to Markdown.
 - **Input:** `raw_page_html` and `url`.
 - **Behavior:** Use Trafilatura to remove page boilerplate and extract readable content.
-- **Output:** `markdown_content`.
+- **Output:** `CleanOutcome` with Markdown, extraction state, and input/output byte counts.
+
+See [docs/module4.md](docs/module4.md) for extraction options and empty/error behavior. Module 4 processes the HTML string it receives; it does not interpret fetch status.
+
+### FastAPI orchestration and trace
+
+FastAPI authenticates requests with bearer keys from the ignored `data/api_keys.txt`, validates input, calls the modules in sequence, and appends lifecycle events to SQLite. The trace stores Module 1 candidate links and Module 2 selected links, plus per-page status, render/extraction outcomes, timings, and byte counts. It does not store fetched HTML or Markdown.
+
+See [docs/orchestrator.md](docs/orchestrator.md) for transition ownership, recovery policy, event schema, and retention.
 
 ## 4. Pipeline flows
 
@@ -103,4 +111,4 @@ We want a small query-to-page pipeline with a persistent local browser session. 
 - Keep `json` enabled in `searxng/settings.yml`, or Module 1 gets a clean `SearchError`.
 - SearXNG is on `49731`, the app on `8000`. Change one and update `SEARXNG_URL` too.
 - `make stop` and `dev-down.sh` use `pkill`, so they'll take down other uvicorn processes too.
-- `tests/test_search_unit.py` and `tests/test_parser_unit.py` are offline. The integration files call live SearXNG and local browser fixtures; `make test` starts what they need.
+- `tests/test_search_unit.py`, `tests/test_parser_unit.py`, `tests/test_fetcher_unit.py`, and `tests/test_cleaner_unit.py` are offline. The integration files call live SearXNG and local browser fixtures; `make test` starts what they need.
