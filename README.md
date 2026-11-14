@@ -1,114 +1,76 @@
-# Local, Stateless Search & Scraping Pipeline
+# Internet Use
 
-## 1. Overview
+Self-hosted, sequential search and scraping pipeline. It accepts a query or direct URL, discovers pages with SearXNG, renders them with Patchright, extracts Markdown with Trafilatura, and returns structured JSON.
 
-Build a self-hosted, sequential search and extraction pipeline for a Mac mini. It accepts a search query or a direct URL, discovers pages through local SearXNG, renders target pages in a persistent Patchright browser, cleans their content into Markdown, and returns structured results.
+## Layout
 
-Each stage has a clear input and output contract. The initial design favors simplicity and reliability over concurrency.
+- `app/main.py` — FastAPI endpoints, bearer auth, request lifecycle.
+- `app/pipeline.py` — pure state/transition core.
+- `app/orchestrator.py` — FIFO worker, retries, stage calls.
+- `app/tracer.py` — SQLite trace events.
+- `app/search.py`, `app/parser.py`, `app/fetcher.py`, `app/cleaner.py` — search, normalization, fetch, extraction.
+- `app/urls.py` — shared HTTP URL validation.
 
-## 2. Design principles
+## Requirements
 
-- **Small pipeline:** Keep each stage focused and easy to replace.
-- **Sequential browser use:** Run one browser operation at a time to avoid profile locks and resource overhead.
-- **Self-hosted search:** Use SearXNG as the search interface, with enabled engines configured centrally. SearXNG sends queries to those upstream engines; it avoids a paid search API, but is not offline.
-- **Persistent browser session:** Use Patchright with a local Chrome profile for JavaScript rendering and reusable session state.
-- **Local content extraction:** Use Trafilatura to turn rendered page HTML into readable Markdown.
+- Python 3.12
+- Docker for SearXNG
+- Chrome
+- A GUI-enabled macOS session for production (Patchright uses headed Chrome)
 
-## 3. Modules
+## Setup
 
-### Module 1: SearXNG Search Client (`fetch_search_response`)
+```bash
+mkdir -p data
+printf 'replace-with-a-long-random-key\n' > data/api_keys.txt
+chmod 600 data/api_keys.txt
+make start
+```
 
-- **Role:** Query the locally hosted SearXNG `/search` endpoint.
-- **Input:** `query`.
-- **Behavior:** Request JSON output and return the parsed response. SearXNG must have JSON output enabled; its configured engines determine the upstream search sources. DuckDuckGo can be enabled as one engine.
-- **Output:** `search_response` (structured JSON).
+SearXNG runs on `localhost:49731`; the API runs on `127.0.0.1:8000`. Keep JSON output enabled in `searxng/settings.yml`.
 
-See [docs/module1.md](docs/module1.md) for the detailed contract.
+## API
 
-### Module 2: Search Response Normalizer (`parse_search_response`)
+```bash
+curl -sS http://127.0.0.1:8000/extract \
+  -H 'Authorization: Bearer replace-with-a-long-random-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/article"}'
+```
 
-- **Role:** Convert SearXNG's response into consistent search hits.
-- **Input:** `search_response`, result limit, and optional domain denylist.
-- **Behavior:** Normalize title, URL, and snippet; remove invalid or duplicate URLs; apply the denylist; keep the requested number of hits.
-- **Output:** `List[SearchHit]` with normalized titles, URLs, snippets, and search metadata.
+- `GET /health` — unauthenticated.
+- `POST /extract` — requires `Authorization: Bearer <key>` and exactly one of `query` or `url`.
 
-See [docs/module2.md](docs/module2.md) for the detailed contract.
+One FIFO worker processes jobs sequentially. Queue full returns `503`; queue wait expiry returns `504`. Per-page failures do not fail the whole search request.
 
-### Module 3: Target Page Scraper (`fetch_target_page`)
+## Pipeline
 
-- **Role:** Load a destination page in a JavaScript-capable browser and return a bounded rendered snapshot.
-- **Input:** `url`.
-- **Behavior:** Use Patchright with a persistent local Chrome profile, block private and metadata destinations at the network boundary, navigate to the URL, wait for the DOM to settle, then capture the rendered HTML.
-- **Output:** `FetchOutcome` (`PageSnapshot` or `FetchFailure`) with the requested/final URLs, title, status, content type, HTML, render state, and warnings.
+- Direct URL: render → extract Markdown.
+- Query: SearXNG search → normalize/dedupe → render and extract each result.
+- Pages are visited sequentially with a small randomized delay.
 
-See [docs/module3.md](docs/module3.md) for browser lifecycle, URL safety, rendering limits, and failure handling.
+Trace events are appended to `data/traces.sqlite3`. Fetched HTML and Markdown are not stored.
 
-### Module 4: Content Cleaner (`clean_to_markdown`)
+## Configuration
 
-- **Role:** Extract the main content and convert it to Markdown.
-- **Input:** `raw_page_html` and `url`.
-- **Behavior:** Use Trafilatura to remove page boilerplate and extract readable content.
-- **Output:** `CleanOutcome` with Markdown, extraction state, and input/output byte counts.
+| Variable | Default |
+| --- | --- |
+| `SEARXNG_URL` | `http://localhost:49731` |
+| `TRACE_DB_PATH` | `data/traces.sqlite3` |
+| `API_KEYS_FILE` | `data/api_keys.txt` |
+| `QUEUE_MAX_SIZE` | `100` |
+| `QUEUE_WAIT_S` | `30` |
+| `MAX_REQUEST_BYTES` | `1000000` |
 
-See [docs/module4.md](docs/module4.md) for extraction options and empty/error behavior. Module 4 processes the HTML string it receives; it does not interpret fetch status.
+## Commands
 
-### FastAPI orchestration and trace
+```bash
+make install                 # install dependencies
+./scripts/dev-up.sh          # SearXNG + app with reload
+RELOAD= ./scripts/dev-up.sh  # no file watcher
+make test                    # mypy + full test suite
+make browser-profile         # sign in to sites for the fetch stage
+./scripts/dev-down.sh        # stop services
+```
 
-FastAPI authenticates requests with bearer keys from the ignored `data/api_keys.txt`, validates input, calls the modules in sequence, and appends lifecycle events to SQLite. The trace stores Module 1 candidate links and Module 2 selected links, plus per-page status, render/extraction outcomes, timings, and byte counts. It does not store fetched HTML or Markdown.
-
-See [docs/orchestrator.md](docs/orchestrator.md) for transition ownership, recovery policy, event schema, and retention.
-
-## 4. Pipeline flows
-
-### Direct URL
-
-1. Receive a target URL.
-2. Fetch its rendered HTML with Module 3.
-3. Clean it with Module 4.
-4. Return an `ExtractedPage` containing the URL and Markdown.
-
-### Search query
-
-1. Query SearXNG with Module 1.
-2. Normalize and filter its response with Module 2 to get the top hits.
-3. Visit each hit sequentially with Module 3, then clean it with Module 4.
-4. Return the extracted pages with their titles, URLs, and Markdown content.
-
-## 5. Alternatives and scope decision
-
-Coverage depends on the browser, session, network, and site defenses. No tool has a meaningful universal site-count guarantee.
-
-| Tool | Coverage | Scope | Pros |
-|---|---|---|---|
-| **Our pipeline** | Patchright runs JavaScript and reuses a local browser profile. | Search → render → Markdown. | Focused workflow; persistent session control. |
-| [CRW](https://docs.fastcrw.com/) | Multiple renderer paths; access still depends on the self-hosted network and site defenses. | Search, scrape, crawl, map, extraction, MCP, browser companion. | Broad features; renderer fallbacks. |
-| [Firecrawl](https://github.com/firecrawl/firecrawl) | Browser-backed scraping; self-hosted coverage depends on deployment and network. | Search, scrape, crawl, map, interact, structured extraction, documents. | Broad, ready-made API. |
-| [Crawl4AI](https://docs.crawl4ai.com/) | Configurable browser crawling and JavaScript execution. | Crawler, Markdown, CSS/XPath and LLM extraction. | Flexible crawler framework. |
-
-### Why build this smaller pipeline
-
-We want a small query-to-page pipeline with a persistent local browser session. That gives us direct control over the workflow and avoids adopting features we do not currently need. Coverage and fidelity remain things to measure against our target sites.
-
-## 6. Operational constraints
-
-- **Concurrency:** One active browser operation at a time.
-- **Pacing:** Add a small randomized delay (about 0.5–1 second) between target pages. Browser navigation and extraction already take time; tune pacing based on observed responses.
-- **Per-page failures:** Log an individual page failure and continue with the next hit. Do not let an inaccessible page fail the whole search request.
-
-## 7. Commands
-
-- **First-time setup (for LSP):** `make install`
-- **Dev:** `./scripts/dev-up.sh` — starts SearXNG, waits for it to be healthy, then runs the app on `127.0.0.1:8000`. `Ctrl+C` tears both down.
-- **Prod:** `RELOAD= ./scripts/dev-up.sh` — same thing, just no file watcher.
-- **Test:** `make test` — starts SearXNG if needed, runs mypy + unit/integration tests, then tears down only what it started. Browser integration tests use local fixtures with headless Chrome.
-- **Sign in to sites:** Stop the app, then run `make browser-profile`. This opens the persistent Chrome profile used by Module 3; close its windows when finished before starting the app again.
-- **Teardown:** `./scripts/dev-down.sh` (safe to run twice).
-
-## 8. Sharp edges
-
-- The production app has to run in a **GUI-enabled, logged-in macOS session**. Patchright drives headed Chrome, so SSH or a headless production box won't work. Tests use headless Chrome against local fixtures.
-- SearXNG lives in Docker; the app stays on the host.
-- Keep `json` enabled in `searxng/settings.yml`, or Module 1 gets a clean `SearchError`.
-- SearXNG is on `49731`, the app on `8000`. Change one and update `SEARXNG_URL` too.
-- `make stop` and `dev-down.sh` use `pkill`, so they'll take down other uvicorn processes too.
-- `tests/test_search_unit.py`, `tests/test_parser_unit.py`, `tests/test_fetcher_unit.py`, and `tests/test_cleaner_unit.py` are offline. The integration files call live SearXNG and local browser fixtures; `make test` starts what they need.
+Production must run in a logged-in GUI session. SearXNG stays in Docker; the app and trace database stay on the host. `make stop` and `dev-down.sh` use `pkill`, so they may also stop other uvicorn processes.

@@ -7,3 +7,4 @@ __pycache__/
 uvicorn.pid
 data/browser-profile/
 data/api_keys.txt
+data/traces.sqlite3*

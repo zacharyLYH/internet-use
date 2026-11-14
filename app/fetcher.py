@@ -21,6 +21,8 @@ from patchright.sync_api import (
     sync_playwright,
 )
 
+from app.urls import parse_http_url
+
 ErrorCode = Literal[
     "invalid_url",
     "blocked_destination",
@@ -116,9 +118,14 @@ class Browser:
         self._context: BrowserContext | None = None
         self._host_cache: dict[str, bool] = {}
 
-    def fetch(self, url: str) -> FetchOutcome:
+    def fetch(
+        self, url: str, *, total_timeout_s: float | None = None
+    ) -> FetchOutcome:
         started = time.monotonic()
-        outcome = self._fetch(url, started)
+        budget = self._total_timeout_s
+        if total_timeout_s is not None:
+            budget = min(budget, total_timeout_s)
+        outcome = self._fetch(url, started, budget)
         host = (urlsplit(outcome.requested_url).hostname or "").lower()
         status: int | None | str
         render: str
@@ -137,20 +144,24 @@ class Browser:
         )
         return outcome
 
-    def _fetch(self, url: str, started: float) -> FetchOutcome:
+    def _fetch(
+        self, url: str, started: float, total_timeout_s: float
+    ) -> FetchOutcome:
         requested = url.strip()
-        parsed = _parse_target(requested)
+        parsed = parse_http_url(requested)
         if parsed is None:
             return _failure(requested, "invalid_url")
         initial = _initial_error(parsed, self._allow_private)
         if initial is not None:
             return _failure(requested, initial)
+        if total_timeout_s <= 0:
+            return _failure(requested, "navigation_timeout")
 
-        budget = max(0.0, self._total_timeout_s - (time.monotonic() - started))
+        budget = max(0.0, total_timeout_s - (time.monotonic() - started))
         if not self._lock.acquire(timeout=budget):
             return _failure(requested, "navigation_timeout")
         try:
-            return self._fetch_locked(requested, started)
+            return self._fetch_locked(requested, started, total_timeout_s)
         except Error:
             self._close_context()
             return _failure(requested, "browser_unavailable")
@@ -166,7 +177,9 @@ class Browser:
         finally:
             self._lock.release()
 
-    def _fetch_locked(self, requested: str, started: float) -> FetchOutcome:
+    def _fetch_locked(
+        self, requested: str, started: float, total_timeout_s: float
+    ) -> FetchOutcome:
         context = self._ensure_context()
         page = context.new_page()
         warnings: set[WarningCode] = set()
@@ -223,7 +236,7 @@ class Browser:
                 response = page.goto(
                     requested,
                     wait_until="domcontentloaded",
-                    timeout=self._nav_timeout_ms,
+                    timeout=_nav_timeout_ms(self._nav_timeout_ms, total_timeout_s),
                 )
             except TimeoutError:
                 timed_out = True
@@ -243,7 +256,7 @@ class Browser:
             if content_type and content_type not in _HTML_TYPES:
                 return _failure(requested, "unsupported_content_type")
 
-            settle = self._settle(page, started)
+            settle = self._settle(page, started, total_timeout_s)
             if settle == "too_large":
                 return _failure(requested, "response_too_large")
             if timed_out or settle == "timeout":
@@ -289,20 +302,18 @@ class Browser:
         self._profile_dir.mkdir(parents=True, exist_ok=True)
         self._profile_dir.chmod(0o700)
         executable = os.getenv("CHROME_EXECUTABLE")
+        options: dict[str, Any] = {
+            "headless": self._headless,
+            "no_viewport": True,
+        }
         if executable:
-            self._context = _get_playwright().chromium.launch_persistent_context(
-                str(self._profile_dir.resolve()),
-                headless=self._headless,
-                no_viewport=True,
-                executable_path=executable,
-            )
+            options["executable_path"] = executable
         else:
-            self._context = _get_playwright().chromium.launch_persistent_context(
-                str(self._profile_dir.resolve()),
-                headless=self._headless,
-                no_viewport=True,
-                channel="chrome",
-            )
+            options["channel"] = "chrome"
+        self._context = _get_playwright().chromium.launch_persistent_context(
+            str(self._profile_dir.resolve()),
+            **options,
+        )
         return self._context
 
     def _close_context(self) -> None:
@@ -313,9 +324,11 @@ class Browser:
             except Error:
                 pass
 
-    def _settle(self, page: Page, started: float) -> SettleResult:
+    def _settle(
+        self, page: Page, started: float, total_timeout_s: float
+    ) -> SettleResult:
         deadline = min(
-            started + self._total_timeout_s, time.monotonic() + self._settle_timeout_s
+            started + total_timeout_s, time.monotonic() + self._settle_timeout_s
         )
         previous: tuple[str, int, str] | None = None
         stable = 0
@@ -340,22 +353,6 @@ def _failure(url: str, code: ErrorCode) -> FetchFailure:
     return FetchFailure(url, code, MESSAGES[code])
 
 
-def _parse_target(url: str) -> SplitResult | None:
-    try:
-        parsed = urlsplit(url)
-        _ = parsed.port
-    except ValueError:
-        return None
-    if (
-        parsed.scheme not in ("http", "https")
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-    ):
-        return None
-    return parsed
-
-
 def _initial_error(parsed: SplitResult, allow_private: bool) -> ErrorCode | None:
     host = parsed.hostname
     if host is None:
@@ -369,7 +366,7 @@ def _initial_error(parsed: SplitResult, allow_private: bool) -> ErrorCode | None
 
 
 def _url_allowed(url: str, allow_private: bool, cache: dict[str, bool]) -> bool:
-    parsed = _parse_target(url)
+    parsed = parse_http_url(url)
     if parsed is None or parsed.hostname is None:
         return False
     return _host_allowed(parsed.hostname, allow_private, cache)
@@ -421,6 +418,10 @@ def _nav_error_code(exc: Error) -> ErrorCode:
     return "redirect_error" if "ERR_TOO_MANY_REDIRECTS" in str(exc).upper() else "network_error"
 
 
+def _nav_timeout_ms(configured_ms: int, total_timeout_s: float) -> int:
+    return max(1, min(configured_ms, int(total_timeout_s * 1000)))
+
+
 def _content_type(response: Response | None) -> str:
     if response is None:
         return ""
@@ -465,20 +466,29 @@ def _stop_playwright() -> None:
     if playwright is not None:
         try:
             playwright.stop()
-        except Error:
+        except Exception:
             pass
 
 
 _browser = Browser()
 
 
-def _shutdown() -> None:
-    _browser.close()
+def shutdown_fetcher() -> None:
+    try:
+        _browser.close()
+    except Exception:
+        pass
     _stop_playwright()
+
+
+def _shutdown() -> None:
+    shutdown_fetcher()
 
 
 atexit.register(_shutdown)
 
 
-def fetch_target_page(url: str) -> FetchOutcome:
-    return _browser.fetch(url)
+def fetch_target_page(
+    url: str, *, total_timeout_s: float | None = None
+) -> FetchOutcome:
+    return _browser.fetch(url, total_timeout_s=total_timeout_s)

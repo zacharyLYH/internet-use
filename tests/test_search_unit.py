@@ -95,10 +95,63 @@ def test_invalid_json_raises_search_error(monkeypatch: pytest.MonkeyPatch) -> No
         fetch_search_response("anything")
 
 
-def test_non_object_json_raises_search_error(
+def test_non_object_json_raises_nonretryable_search_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_get(monkeypatch, make_response([]))
 
-    with pytest.raises(SearchError):
+    with pytest.raises(SearchError) as raised:
         fetch_search_response("anything")
+
+    assert raised.value.retryable is False
+
+
+def test_timeout_is_passed_to_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = patch_get(monkeypatch, make_response({"results": []}))
+
+    fetch_search_response("q", timeout_s=2.5)
+
+    assert captured[0]["timeout"] == 2.5
+
+
+def test_invalid_timeout_raises() -> None:
+    with pytest.raises(ValueError):
+        fetch_search_response("q", timeout_s=0)
+
+
+def test_5xx_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_get(
+        monkeypatch,
+        httpx.Response(502, request=httpx.Request("GET", SEARXNG_URL)),
+    )
+
+    with pytest.raises(SearchError) as raised:
+        fetch_search_response("q")
+
+    assert raised.value.retryable is True
+
+
+def test_4xx_is_not_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_get(
+        monkeypatch,
+        httpx.Response(400, request=httpx.Request("GET", SEARXNG_URL)),
+    )
+
+    with pytest.raises(SearchError) as raised:
+        fetch_search_response("q")
+
+    assert raised.value.retryable is False
+
+
+def test_invalid_json_is_not_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_get(
+        monkeypatch,
+        httpx.Response(
+            200, text="<html>error</html>", request=httpx.Request("GET", SEARXNG_URL)
+        ),
+    )
+
+    with pytest.raises(SearchError) as raised:
+        fetch_search_response("q")
+
+    assert raised.value.retryable is False

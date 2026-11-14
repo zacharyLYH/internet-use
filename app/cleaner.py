@@ -2,9 +2,10 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlsplit
 
 from trafilatura import extract
+
+from app.urls import is_valid_http_url
 
 ExtractionState = Literal["extracted", "empty"]
 CleanErrorCode = Literal["invalid_input", "extraction_error"]
@@ -59,7 +60,7 @@ def _clean(raw_page_html: object, url: object) -> CleanOutcome:
     if not isinstance(raw_page_html, str) or not isinstance(url, str):
         return _failure("invalid_input")
     target = url.strip()
-    if not _valid_url(target):
+    if not is_valid_http_url(target):
         return _failure("invalid_input")
     try:
         source_bytes = len(raw_page_html.encode("utf-8"))
@@ -87,20 +88,6 @@ def _clean(raw_page_html: object, url: object) -> CleanOutcome:
         return CleanSuccess("", "empty", source_bytes, 0)
     return CleanSuccess(
         content, "extracted", source_bytes, len(content.encode("utf-8"))
-    )
-
-
-def _valid_url(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-        _ = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme in ("http", "https")
-        and bool(parsed.hostname)
-        and not parsed.username
-        and not parsed.password
     )
 
 
