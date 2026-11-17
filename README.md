@@ -21,11 +21,10 @@ Self-hosted, sequential search and scraping pipeline. It accepts a query or dire
 ## Setup
 
 ```bash
-mkdir -p data
-printf 'replace-with-a-long-random-key\n' > data/api_keys.txt
-chmod 600 data/api_keys.txt
 make start
 ```
+
+`make start` installs dependencies, creates `data/api_keys.txt` (printing the bearer key) if missing, starts SearXNG with Docker Compose, and runs the API in the foreground. On the first run, copy the printed key for API requests.
 
 SearXNG runs on `localhost:49731`; the API runs on `127.0.0.1:8000`. Keep JSON output enabled in `searxng/settings.yml`.
 
@@ -66,11 +65,11 @@ Trace events are appended to `data/traces.sqlite3`. Fetched HTML and Markdown ar
 
 ```bash
 make install                 # install dependencies
-./scripts/dev-up.sh          # SearXNG + app with reload
-RELOAD= ./scripts/dev-up.sh  # no file watcher
+make start                   # SearXNG + app (creates API key if missing)
+RELOAD= make start           # no file watcher
+make stop                    # stop app + SearXNG
 make test                    # mypy + full test suite
 make browser-profile         # sign in to sites for the fetch stage
-./scripts/dev-down.sh        # stop services
 ```
 
 Production must run in a logged-in GUI session. SearXNG stays in Docker; the app and trace database stay on the host. `make stop` and `dev-down.sh` use `pkill`, so they may also stop other uvicorn processes.
