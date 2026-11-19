@@ -35,7 +35,11 @@ def test_writes_ordered_events_with_json_details(tmp_path: Path) -> None:
     init_tracer(db_path)
     request_id = uuid4()
 
-    write_event("api.ingress", request_id, {"method": "POST", "path": "/extract"})
+    write_event(
+        "api.ingress",
+        request_id,
+        {"method": "POST", "path": "/v1/chat/completions"},
+    )
     write_event("request.completed", request_id, {"counts": {"extracted": 1}})
     write_event("other.event", "not-a-uuid", {"ok": True})
     close_tracer()
@@ -47,7 +51,10 @@ def test_writes_ordered_events_with_json_details(tmp_path: Path) -> None:
         ).fetchall()
 
     assert rows[0][:2] == (str(request_id), "api.ingress")
-    assert json.loads(rows[0][2]) == {"method": "POST", "path": "/extract"}
+    assert json.loads(rows[0][2]) == {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+    }
     assert rows[1][1] == "request.completed"
     assert rows[2][0] == "not-a-uuid"
     assert stat.S_IMODE(db_path.stat().st_mode) == 0o600

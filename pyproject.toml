@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["mypy", "pytest"]
+dev = ["mypy", "openai", "pytest"]
 
 [tool.mypy]
 python_version = "3.12"

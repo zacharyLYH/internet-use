@@ -31,14 +31,16 @@ SearXNG runs on `localhost:49731`; the API runs on `127.0.0.1:8000`. Keep JSON o
 ## API
 
 ```bash
-curl -sS http://127.0.0.1:8000/extract \
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Authorization: Bearer replace-with-a-long-random-key' \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.com/article"}'
+  -d '{"model":"any","messages":[{"role":"user","content":"https://example.com/article"}]}'
 ```
 
+The endpoint accepts the OpenAI chat completions request shape; `model` is ignored. The last user message is treated as a URL when it is a single absolute HTTP(S) URL, otherwise as a search query.
+
 - `GET /health` — unauthenticated.
-- `POST /extract` — requires `Authorization: Bearer <key>` and exactly one of `query` or `url`.
+- `POST /v1/chat/completions` — requires `Authorization: Bearer <key>`.
 
 One FIFO worker processes jobs sequentially. Queue full returns `503`; queue wait expiry returns `504`. Per-page failures do not fail the whole search request.
 

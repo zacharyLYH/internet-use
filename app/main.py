@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import RequestResponseEndpoint
@@ -73,6 +73,29 @@ class ApiError(Exception):
 
 class Health(BaseModel):
     status: str
+
+
+class ChatContentPart(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    text: str | None = None
+
+
+class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    role: str
+    content: str | list[ChatContentPart] | None = None
+
+
+class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_results: int | None = Field(default=None, ge=1, le=20)
+    max_pages: int | None = Field(default=None, ge=1, le=10)
 
 
 def create_app(
@@ -201,53 +224,87 @@ def create_app(
     def health() -> Health:
         return Health(status="ok")
 
-    @app.post("/extract", response_model=ExtractResponse)
-    def extract(payload: ExtractRequest, request: Request) -> ExtractResponse:
-        query = (payload.query or "").strip()
-        url = (payload.url or "").strip()
-        if bool(query) == bool(url):
-            raise ApiError(
-                400,
-                "invalid_request",
-                "Exactly one of query or url is required.",
-            )
-        if url and not is_valid_http_url(url):
-            raise ApiError(
-                400,
-                "invalid_request",
-                "url must be an absolute http(s) URL without credentials.",
-            )
-
-        request_queue: RequestQueue = request.app.state.request_queue
-        try:
-            return request_queue.submit(_request_id(request), payload)
-        except QueueFullError as exc:
-            raise ApiError(
-                503, "queue_full", "The request queue is full."
-            ) from exc
-        except QueueExpiredError as exc:
-            raise ApiError(
-                504,
-                "queue_timeout",
-                "The request timed out while waiting.",
-            ) from exc
-        except QueueStoppedError as exc:
-            raise ApiError(
-                503, "service_unavailable", "The service is shutting down."
-            ) from exc
-        except PipelineError as exc:
-            raise ApiError(exc.status_code, exc.code, exc.message) from exc
-        except TraceError as exc:
-            raise ApiError(
-                503, "trace_unavailable", "Trace storage is unavailable."
-            ) from exc
-        except Exception as exc:
-            logger.exception("pipeline request failed")
-            raise ApiError(
-                500, "internal_error", "The request failed."
-            ) from exc
+    @app.post("/v1/chat/completions", response_model=ExtractResponse)
+    def chat_completions(
+        payload: ChatCompletionRequest, request: Request
+    ) -> ExtractResponse:
+        return _submit(request, _extract_request_from_chat(payload))
 
     return app
+
+
+def _submit(request: Request, payload: ExtractRequest) -> ExtractResponse:
+    request_queue: RequestQueue = request.app.state.request_queue
+    try:
+        return request_queue.submit(_request_id(request), payload)
+    except QueueFullError as exc:
+        raise ApiError(
+            503, "queue_full", "The request queue is full."
+        ) from exc
+    except QueueExpiredError as exc:
+        raise ApiError(
+            504,
+            "queue_timeout",
+            "The request timed out while waiting.",
+        ) from exc
+    except QueueStoppedError as exc:
+        raise ApiError(
+            503, "service_unavailable", "The service is shutting down."
+        ) from exc
+    except PipelineError as exc:
+        raise ApiError(exc.status_code, exc.code, exc.message) from exc
+    except TraceError as exc:
+        raise ApiError(
+            503, "trace_unavailable", "Trace storage is unavailable."
+        ) from exc
+    except Exception as exc:
+        logger.exception("pipeline request failed")
+        raise ApiError(
+            500, "internal_error", "The request failed."
+        ) from exc
+
+
+def _extract_request_from_chat(payload: ChatCompletionRequest) -> ExtractRequest:
+    text = _chat_text(payload)
+    max_results = (
+        payload.max_results if payload.max_results is not None else 5
+    )
+    max_pages = payload.max_pages if payload.max_pages is not None else 3
+    if is_valid_http_url(text):
+        return ExtractRequest(
+            url=text, max_results=max_results, max_pages=max_pages
+        )
+    return ExtractRequest(
+        query=text, max_results=max_results, max_pages=max_pages
+    )
+
+
+def _chat_text(payload: ChatCompletionRequest) -> str:
+    for role in ("user", None):
+        for message in reversed(payload.messages):
+            if role is not None and message.role != role:
+                continue
+            content = _message_text(message)
+            if content:
+                return content
+    raise ApiError(
+        400,
+        "invalid_request",
+        "A message with text content is required.",
+    )
+
+
+def _message_text(message: ChatMessage) -> str:
+    content = message.content
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            part.text.strip()
+            for part in content
+            if part.type == "text" and part.text and part.text.strip()
+        ).strip()
+    return ""
 
 
 def _request_id(request: Request) -> UUID:

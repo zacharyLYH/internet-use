@@ -1,16 +1,22 @@
+import asyncio
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 
 import app.fetcher as fetcher_module
 from app.fetcher import Browser
 from app.main import AppSettings, create_app
 from app.orchestrator import (
+    ExtractRequest,
+    ExtractResponse,
     OrchestratorConfig,
     QueueExpiredError,
     RequestQueue,
@@ -81,12 +87,38 @@ def _headers(key: str | None = API_KEY) -> dict[str, str]:
 def _post(
     client: TestClient, payload: dict[str, object], key: str | None = API_KEY
 ) -> httpx.Response:
-    return cast(httpx.Response, client.post("/extract", json=payload, headers=_headers(key)))
+    content = payload.get("url", payload.get("query", ""))
+    chat_payload: dict[str, object] = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": content}],
+    }
+    for field in ("max_results", "max_pages"):
+        if field in payload:
+            chat_payload[field] = payload[field]
+    return cast(
+        httpx.Response,
+        client.post(
+            "/v1/chat/completions", json=chat_payload, headers=_headers(key)
+        ),
+    )
 
 
 def _db_path(client: TestClient) -> Path:
     settings = cast(AppSettings, cast(Any, client.app).state.settings)
     return settings.trace_db_path
+
+
+@asynccontextmanager
+async def _openai_client(client: TestClient) -> AsyncIterator[AsyncOpenAI]:
+    transport = httpx2.ASGITransport(app=cast(Any, client.app))
+    async with httpx2.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http_client:
+        yield AsyncOpenAI(
+            api_key=API_KEY,
+            base_url="http://testserver/v1",
+            http_client=http_client,
+        )
 
 
 def test_health_is_unauthenticated_and_traced(client: TestClient) -> None:
@@ -122,27 +154,41 @@ def test_invalid_api_key_is_rejected(client: TestClient) -> None:
     "payload",
     [
         {},
-        {"query": "q", "url": "https://example.com/a"},
-        {"query": ""},
-        {"query": "q", "max_results": 0},
-        {"query": "q", "max_pages": 11},
-        {"query": "q", "unknown": True},
-        {"url": "not-a-url"},
-        {"url": "ftp://example.com/a"},
-        {"url": "https://user:pass@example.com/a"},
+        {"model": "m", "messages": []},
+        {"model": "m", "messages": [{"role": "user", "content": ""}]},
+        {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "image_url"}]}
+            ],
+        },
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "q"}],
+            "max_results": 0,
+        },
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "q"}],
+            "max_pages": 11,
+        },
     ],
 )
 def test_invalid_request_is_rejected(
     client: TestClient, payload: dict[str, object]
 ) -> None:
-    response = _post(client, payload)
+    response = client.post(
+        "/v1/chat/completions", json=payload, headers=_headers()
+    )
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_validation_failure_is_traced(client: TestClient) -> None:
-    response = _post(client, {"query": "q", "unknown": True})
+    response = client.post(
+        "/v1/chat/completions", json={}, headers=_headers()
+    )
 
     request_id = response.json()["request_id"]
     events = read_trace_events(_db_path(client), request_id)
@@ -155,8 +201,13 @@ def test_validation_failure_is_traced(client: TestClient) -> None:
 
 def test_body_too_large_is_rejected(client: TestClient) -> None:
     response = client.post(
-        "/extract",
-        content=json.dumps({"query": "x" * 3000}),
+        "/v1/chat/completions",
+        content=json.dumps(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "x" * 3000}],
+            }
+        ),
         headers={**_headers(), "Content-Type": "application/json"},
     )
 
@@ -200,6 +251,65 @@ def test_direct_article_end_to_end(
     completed = dict(events)["request.completed"]
     assert completed["outcome"] == "completed"
     assert completed["counts"]["extracted"] == 1
+
+
+def test_openai_sdk_chat_completions_reads_url(
+    client: TestClient, site: str
+) -> None:
+    async def create() -> Any:
+        async with _openai_client(client) as sdk:
+            return await sdk.chat.completions.with_raw_response.create(
+                model="openai/gpt-5.2:online",
+                messages=[{"role": "user", "content": f"{site}/article"}],
+            )
+
+    raw = asyncio.run(create())
+
+    assert raw.http_response.status_code == 200
+    body = raw.parse(to=dict)
+    assert body["outcome"] == "completed"
+    assert "Article title" in body["pages"][0]["markdown"]
+
+
+def test_openai_sdk_chat_completions_reads_query(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_queue = cast(RequestQueue, cast(Any, client.app).state.request_queue)
+    captured: dict[str, ExtractRequest] = {}
+
+    def capture(request_id: object, payload: ExtractRequest) -> ExtractResponse:
+        captured["payload"] = payload
+        return ExtractResponse(request_id=str(request_id), outcome="completed")
+
+    monkeypatch.setattr(request_queue, "submit", capture)
+
+    async def create() -> Any:
+        async with _openai_client(client) as sdk:
+            return await sdk.chat.completions.with_raw_response.create(
+                model="openai/gpt-5.2:online",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "What are today's top tech news stories?"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            )
+
+    raw = asyncio.run(create())
+
+    assert raw.http_response.status_code == 200
+    assert raw.parse(to=dict)["outcome"] == "completed"
+    assert captured["payload"].query == (
+        "What are today's top tech news stories?"
+    )
+    assert captured["payload"].url is None
 
 
 def test_redirect_reports_final_url(client: TestClient, site: str) -> None:
