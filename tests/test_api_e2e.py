@@ -14,12 +14,11 @@ from openai import AsyncOpenAI
 import app.fetcher as fetcher_module
 from app.fetcher import Browser
 from app.main import AppSettings, create_app
-from app.orchestrator import (
+from app.orchestrator import QueueExpiredError, RequestQueue
+from app.pipeline import (
     ExtractRequest,
     ExtractResponse,
     OrchestratorConfig,
-    QueueExpiredError,
-    RequestQueue,
 )
 from app.tracer import close_tracer
 from tests.test_utils import (

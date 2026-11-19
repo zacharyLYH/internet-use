@@ -2,6 +2,7 @@ import atexit
 import ipaddress
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -92,6 +93,9 @@ _CHALLENGE_MARKERS = (
     "verify you are human",
     "attention required",
 )
+_SCRIPT_STYLE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
 logger = logging.getLogger(__name__)
 
 
@@ -127,18 +131,14 @@ class Browser:
             budget = min(budget, total_timeout_s)
         outcome = self._fetch(url, started, budget)
         host = (urlsplit(outcome.requested_url).hostname or "").lower()
-        status: int | None | str
-        render: str
         if isinstance(outcome, PageSnapshot):
-            status, error, render = outcome.status_code, "", outcome.render_state
+            detail = f"status={outcome.status_code} render={outcome.render_state}"
         else:
-            status, error, render = "", outcome.error_code, ""
+            detail = f"error={outcome.error_code}"
         logger.info(
-            "fetch host=%s status=%s error=%s render=%s warnings=%s duration_ms=%d",
+            "fetch host=%s %s warnings=%s duration_ms=%d",
             host,
-            status,
-            error,
-            render,
+            detail,
             ",".join(outcome.warnings),
             int((time.monotonic() - started) * 1000),
         )
@@ -357,10 +357,9 @@ def _initial_error(parsed: SplitResult, allow_private: bool) -> ErrorCode | None
     host = parsed.hostname
     if host is None:
         return "invalid_url"
-    addresses = _resolve(host)
-    if not addresses:
+    if not _resolve(host):
         return "network_error"
-    if all(_ip_allowed(address, allow_private) for address in addresses):
+    if _host_allowed(host, allow_private, {}):
         return None
     return "blocked_destination"
 
@@ -443,7 +442,13 @@ def _text_length(page: Page) -> int:
 
 
 def _looks_like_challenge(title: str, html: str) -> bool:
-    probe = f"{title}\n{html[:5000]}".lower()
+    """Challenge markers only count outside scripts and styles.
+
+    Bundle scripts routinely mention captcha or "just a moment", which made
+    ordinary pages look challenged.
+    """
+    body = _SCRIPT_STYLE.sub(" ", html[:20000])
+    probe = f"{title}\n{body[:5000]}".lower()
     return any(marker in probe for marker in _CHALLENGE_MARKERS)
 
 
@@ -481,11 +486,7 @@ def shutdown_fetcher() -> None:
     _stop_playwright()
 
 
-def _shutdown() -> None:
-    shutdown_fetcher()
-
-
-atexit.register(_shutdown)
+atexit.register(shutdown_fetcher)
 
 
 def fetch_target_page(

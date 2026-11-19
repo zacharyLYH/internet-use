@@ -1,6 +1,7 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any, TypedDict
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+
+from app.urls import canonical_url, parse_http_url
 
 
 class SearchHit(TypedDict):
@@ -13,38 +14,25 @@ class SearchHit(TypedDict):
     published: str | None
 
 
-def parse_search_response(
-    search_response: Mapping[str, Any],
-    max_results: int | None = None,
-    domain_denylist: Sequence[str] = (),
-) -> list[SearchHit]:
-    if max_results is not None and max_results < 0:
-        raise ValueError("max_results must not be negative")
+def parse_search_response(search_response: Mapping[str, Any]) -> list[SearchHit]:
     results = search_response.get("results", [])
     if not isinstance(results, list):
         raise ValueError("search response 'results' must be a list")
 
-    denied = {_domain(d) for d in domain_denylist}
-    denied.discard("")
     hits: list[SearchHit] = []
     seen: set[str] = set()
 
     for item in results:
-        if max_results == 0:
-            break
         if not isinstance(item, Mapping):
             continue
 
         title = _text(item.get("title"))
         url = _text(item.get("url"))
-        parsed = urlsplit(url)
-        host = (parsed.hostname or "").lower()
-        if not title or not url or parsed.scheme not in ("http", "https") or not host:
-            continue
-        if _blocked(host, denied):
+        parsed = parse_http_url(url)
+        if not title or parsed is None or not parsed.hostname:
             continue
 
-        key = _canonical(parsed)
+        key = canonical_url(parsed)
         if key in seen:
             continue
         seen.add(key)
@@ -61,8 +49,6 @@ def parse_search_response(
                 "published": published or None,
             }
         )
-        if max_results is not None and len(hits) >= max_results:
-            break
 
     return hits
 
@@ -81,17 +67,3 @@ def _engines(item: Mapping[str, Any]) -> list[str]:
         return [e for e in engines if isinstance(e, str)]
     engine = item.get("engine")
     return [engine] if isinstance(engine, str) else []
-
-
-def _domain(value: str) -> str:
-    return value.strip().lower().lstrip(".")
-
-
-def _blocked(host: str, denied: set[str]) -> bool:
-    return any(host == d or host.endswith(f".{d}") for d in denied)
-
-
-def _canonical(parsed: SplitResult) -> str:
-    return urlunsplit(
-        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, parsed.query, "")
-    )

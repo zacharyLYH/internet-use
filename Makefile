@@ -8,8 +8,9 @@ APP_PORT ?= 8000
 BROWSER_PROFILE_DIR ?= data/browser-profile
 TRACE_DB_PATH ?= data/traces.sqlite3
 API_KEYS_FILE ?= data/api_keys.txt
+LLM_ENV_FILE ?= data/llm.env
 
-.PHONY: install start stop searxng api-key test browser-profile
+.PHONY: install start stop searxng api-key llm-config test browser-profile
 
 $(VENV):
 	$(PYTHON) -m venv $(VENV)
@@ -30,9 +31,13 @@ searxng:
 	@command -v docker >/dev/null 2>&1 || { echo "docker is required to run SearXNG"; exit 1; }
 	@docker compose up -d --wait searxng
 
-start: install api-key searxng
-	SEARXNG_URL=$(SEARXNG_URL) TRACE_DB_PATH=$(TRACE_DB_PATH) API_KEYS_FILE=$(API_KEYS_FILE) \
+start: install api-key searxng llm-config
+	@set -a; if [ -f "$(LLM_ENV_FILE)" ]; then . "$(LLM_ENV_FILE)"; fi; set +a; \
+		SEARXNG_URL=$(SEARXNG_URL) TRACE_DB_PATH=$(TRACE_DB_PATH) API_KEYS_FILE=$(API_KEYS_FILE) \
 		$(VENV)/bin/uvicorn app.main:app --host $(APP_HOST) --port $(APP_PORT) $(RELOAD)
+
+llm-config: install
+	@LLM_ENV_FILE="$(LLM_ENV_FILE)" $(PY) scripts/configure_llm.py
 
 stop:
 	-@pkill -f "uvicorn app.main:app"

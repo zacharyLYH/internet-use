@@ -18,15 +18,17 @@ from starlette.middleware.base import RequestResponseEndpoint
 from app.auth import is_authorized, load_api_keys
 from app.fetcher import shutdown_fetcher
 from app.orchestrator import (
-    ExtractRequest,
-    ExtractResponse,
     Orchestrator,
-    OrchestratorConfig,
-    PipelineError,
     QueueExpiredError,
     QueueFullError,
     QueueStoppedError,
     RequestQueue,
+)
+from app.pipeline import (
+    ExtractRequest,
+    ExtractResponse,
+    OrchestratorConfig,
+    PipelineError,
 )
 from app.tracer import TraceError, close_tracer, init_tracer, write_event
 from app.urls import is_valid_http_url
@@ -238,45 +240,30 @@ def _submit(request: Request, payload: ExtractRequest) -> ExtractResponse:
     try:
         return request_queue.submit(_request_id(request), payload)
     except QueueFullError as exc:
-        raise ApiError(
-            503, "queue_full", "The request queue is full."
-        ) from exc
+        raise ApiError(503, "queue_full", "The request queue is full.") from exc
     except QueueExpiredError as exc:
-        raise ApiError(
-            504,
-            "queue_timeout",
-            "The request timed out while waiting.",
-        ) from exc
+        message = "The request timed out while waiting."
+        raise ApiError(504, "queue_timeout", message) from exc
     except QueueStoppedError as exc:
-        raise ApiError(
-            503, "service_unavailable", "The service is shutting down."
-        ) from exc
+        message = "The service is shutting down."
+        raise ApiError(503, "service_unavailable", message) from exc
     except PipelineError as exc:
         raise ApiError(exc.status_code, exc.code, exc.message) from exc
     except TraceError as exc:
-        raise ApiError(
-            503, "trace_unavailable", "Trace storage is unavailable."
-        ) from exc
+        message = "Trace storage is unavailable."
+        raise ApiError(503, "trace_unavailable", message) from exc
     except Exception as exc:
         logger.exception("pipeline request failed")
-        raise ApiError(
-            500, "internal_error", "The request failed."
-        ) from exc
+        raise ApiError(500, "internal_error", "The request failed.") from exc
 
 
 def _extract_request_from_chat(payload: ChatCompletionRequest) -> ExtractRequest:
     text = _chat_text(payload)
-    max_results = (
-        payload.max_results if payload.max_results is not None else 5
-    )
-    max_pages = payload.max_pages if payload.max_pages is not None else 3
+    max_results = payload.max_results or 5
+    max_pages = payload.max_pages or 3
     if is_valid_http_url(text):
-        return ExtractRequest(
-            url=text, max_results=max_results, max_pages=max_pages
-        )
-    return ExtractRequest(
-        query=text, max_results=max_results, max_pages=max_pages
-    )
+        return ExtractRequest(url=text, max_results=max_results, max_pages=max_pages)
+    return ExtractRequest(query=text, max_results=max_results, max_pages=max_pages)
 
 
 def _chat_text(payload: ChatCompletionRequest) -> str:
@@ -287,11 +274,8 @@ def _chat_text(payload: ChatCompletionRequest) -> str:
             content = _message_text(message)
             if content:
                 return content
-    raise ApiError(
-        400,
-        "invalid_request",
-        "A message with text content is required.",
-    )
+    required = "A message with text content is required."
+    raise ApiError(400, "invalid_request", required)
 
 
 def _message_text(message: ChatMessage) -> str:
@@ -323,12 +307,8 @@ async def _record_event(
 
 
 def _trace_unavailable(request_id: UUID) -> JSONResponse:
-    return _error_response(
-        503,
-        request_id,
-        "trace_unavailable",
-        "Trace storage is unavailable.",
-    )
+    message = "Trace storage is unavailable."
+    return _error_response(503, request_id, "trace_unavailable", message)
 
 
 def _error_response(

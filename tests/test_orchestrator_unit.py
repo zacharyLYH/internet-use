@@ -10,15 +10,18 @@ import pytest
 from app.cleaner import CleanFailure
 from app.fetcher import FetchFailure, FetchOutcome, PageSnapshot
 from app.orchestrator import (
-    ExtractRequest,
-    ExtractResponse,
     Orchestrator,
-    OrchestratorConfig,
-    PipelineError,
     QueueExpiredError,
     QueueFullError,
     RequestQueue,
 )
+from app.pipeline import (
+    ExtractRequest,
+    ExtractResponse,
+    OrchestratorConfig,
+    PipelineError,
+)
+from app.relevance import RelevanceFailure, RelevanceSelection
 from app.search import SearchError
 from app.tracer import close_tracer, init_tracer
 from tests.test_utils import (
@@ -566,3 +569,369 @@ def test_queued_requests_all_resolve(trace_db: Path) -> None:
     assert {response.request_id for response in results} == {
         str(request_id) for request_id in request_ids
     }
+
+
+def test_llm_filter_drops_irrelevant_hits(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hits = [
+        _hit("https://example.com/a", "A"),
+        _hit("https://example.com/b", "B"),
+        _hit("https://example.com/c", "C"),
+    ]
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_search_response",
+        lambda query, *, pageno=1, timeout_s=0.0: {"results": hits},
+    )
+    fetch_calls: list[str] = []
+
+    def fake_fetch(
+        url: str, *, total_timeout_s: float | None = None
+    ) -> FetchOutcome:
+        fetch_calls.append(url)
+        return _snapshot(url)
+
+    monkeypatch.setattr("app.orchestrator.fetch_target_page", fake_fetch)
+    seen: dict[str, object] = {}
+
+    def fake_filter(
+        query: str, candidates: list[object], *, timeout_s: float = 0.0
+    ) -> RelevanceSelection:
+        seen["query"] = query
+        seen["urls"] = [hit["url"] for hit in candidates if isinstance(hit, dict)]
+        seen["timeout"] = timeout_s
+        return RelevanceSelection(
+            frozenset(
+                {
+                    "https://example.com/a",
+                    "https://example.com/c",
+                }
+            )
+        )
+
+    monkeypatch.setattr("app.orchestrator.select_relevant_hits", fake_filter)
+
+    request_id = uuid4()
+    response = Orchestrator(_config(llm_filter_enabled=True)).run(
+        request_id,
+        ExtractRequest(query=" python ", max_results=3, max_pages=1),
+    )
+
+    assert seen == {
+        "query": "python",
+        "urls": [
+            "https://example.com/a",
+            "https://example.com/b",
+            "https://example.com/c",
+        ],
+        "timeout": 10.0,
+    }
+    assert fetch_calls == [
+        "https://example.com/a",
+        "https://example.com/c",
+    ]
+    assert response.outcome == "completed"
+    assert response.counts.selected == 2
+    events = read_trace_events(trace_db, request_id)
+    assert [event for event, _ in events][:7] == [
+        "request.started",
+        "search.started",
+        "search.completed",
+        "normalization.started",
+        "normalization.completed",
+        "relevance.started",
+        "relevance.completed",
+    ]
+    assert dict(events)["relevance.completed"] == {
+        "candidate_count": 3,
+        "kept_count": 2,
+        "dropped_count": 1,
+        "kept": ["https://example.com/a", "https://example.com/c"],
+        "dropped": ["https://example.com/b"],
+    }
+
+
+def test_llm_filter_failure_keeps_every_hit(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hits = [
+        _hit("https://example.com/a", "A"),
+        _hit("https://example.com/b", "B"),
+    ]
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_search_response",
+        lambda query, *, pageno=1, timeout_s=0.0: {"results": hits},
+    )
+    fetch_calls: list[str] = []
+
+    def fake_fetch(
+        url: str, *, total_timeout_s: float | None = None
+    ) -> FetchOutcome:
+        fetch_calls.append(url)
+        return _snapshot(url)
+
+    monkeypatch.setattr("app.orchestrator.fetch_target_page", fake_fetch)
+    monkeypatch.setattr(
+        "app.orchestrator.select_relevant_hits",
+        lambda query, candidates, *, timeout_s=0.0: RelevanceFailure(
+            "llm_request_failed"
+        ),
+    )
+
+    request_id = uuid4()
+    response = Orchestrator(_config(llm_filter_enabled=True)).run(
+        request_id,
+        ExtractRequest(query="q", max_results=2, max_pages=1),
+    )
+
+    assert fetch_calls == [
+        "https://example.com/a",
+        "https://example.com/b",
+    ]
+    assert response.counts.selected == 2
+    events = read_trace_events(trace_db, request_id)
+    assert [event for event, _ in events].count("relevance.failed") == 1
+    assert dict(events)["relevance.failed"] == {
+        "candidate_count": 2,
+        "error_code": "llm_request_failed",
+    }
+
+
+def test_llm_filter_is_skipped_when_disabled(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hits = [
+        _hit("https://example.com/a", "A"),
+        _hit("https://example.com/b", "B"),
+    ]
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_search_response",
+        lambda query, *, pageno=1, timeout_s=0.0: {"results": hits},
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_target_page",
+        lambda url, *, total_timeout_s=None: _snapshot(url),
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.select_relevant_hits",
+        lambda *args, **kwargs: pytest.fail("filter should not run"),
+    )
+
+    request_id = uuid4()
+    Orchestrator(_config()).run(
+        request_id,
+        ExtractRequest(query="q", max_results=2, max_pages=1),
+    )
+
+    event_types = [
+        event for event, _ in read_trace_events(trace_db, request_id)
+    ]
+    assert not [t for t in event_types if t.startswith("relevance.")]
+
+
+def test_llm_filter_is_skipped_for_a_single_hit(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_search_response",
+        lambda query, *, pageno=1, timeout_s=0.0: {
+            "results": [_hit("https://example.com/a", "A")]
+        },
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_target_page",
+        lambda url, *, total_timeout_s=None: _snapshot(url),
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.select_relevant_hits",
+        lambda *args, **kwargs: pytest.fail("filter should not run"),
+    )
+
+    request_id = uuid4()
+    response = Orchestrator(_config(llm_filter_enabled=True)).run(
+        request_id,
+        ExtractRequest(query="q", max_results=1, max_pages=1),
+    )
+
+    assert response.counts.selected == 1
+    event_types = [
+        event for event, _ in read_trace_events(trace_db, request_id)
+    ]
+    assert not [t for t in event_types if t.startswith("relevance.")]
+
+
+def test_low_value_hits_are_dropped_before_the_llm(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = [
+        _hit("https://example.com/login", "Login"),
+        _hit("https://example.com/posts/a", "A"),
+        _hit("https://facebook.com/share?u=x", "Share"),
+        _hit("https://example.com/posts/b", "B"),
+    ]
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_search_response",
+        lambda query, *, pageno=1, timeout_s=0.0: {"results": results},
+    )
+    fetch_calls: list[str] = []
+
+    def fake_fetch(
+        url: str, *, total_timeout_s: float | None = None
+    ) -> FetchOutcome:
+        fetch_calls.append(url)
+        return _snapshot(url)
+
+    monkeypatch.setattr("app.orchestrator.fetch_target_page", fake_fetch)
+    candidates_seen: list[str] = []
+
+    def fake_filter(
+        query: str, candidates: list[object], *, timeout_s: float = 0.0
+    ) -> RelevanceSelection:
+        candidates_seen.extend(
+            hit["url"] for hit in candidates if isinstance(hit, dict)
+        )
+        return RelevanceSelection(frozenset(candidates_seen))
+
+    monkeypatch.setattr("app.orchestrator.select_relevant_hits", fake_filter)
+
+    request_id = uuid4()
+    response = Orchestrator(_config(llm_filter_enabled=True)).run(
+        request_id,
+        ExtractRequest(query="q", max_results=4, max_pages=1),
+    )
+
+    expected = ["https://example.com/posts/a", "https://example.com/posts/b"]
+    assert candidates_seen == expected
+    assert fetch_calls == expected
+    assert response.counts.selected == 2
+    normalized = dict(read_trace_events(trace_db, request_id))[
+        "normalization.completed"
+    ]
+    assert normalized["low_value_count"] == 2
+    assert normalized["selected_count"] == 2
+
+
+def test_llm_filter_backfills_from_another_search_page(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pages = {
+        1: [
+            _hit("https://example.com/a", "A"),
+            _hit("https://example.com/b", "B"),
+            _hit("https://example.com/c", "C"),
+            _hit("https://example.com/d", "D"),
+        ],
+        2: [_hit("https://example.com/e", "E")],
+    }
+    search_calls: list[int] = []
+
+    def fake_search(
+        query: str, *, pageno: int = 1, timeout_s: float = 0.0
+    ) -> dict[str, object]:
+        search_calls.append(pageno)
+        return {"results": pages.get(pageno, [])}
+
+    monkeypatch.setattr("app.orchestrator.fetch_search_response", fake_search)
+    fetch_calls: list[str] = []
+
+    def fake_fetch(
+        url: str, *, total_timeout_s: float | None = None
+    ) -> FetchOutcome:
+        fetch_calls.append(url)
+        return _snapshot(url)
+
+    monkeypatch.setattr("app.orchestrator.fetch_target_page", fake_fetch)
+    rounds: list[list[str]] = []
+
+    def fake_filter(
+        query: str, candidates: list[object], *, timeout_s: float = 0.0
+    ) -> RelevanceSelection:
+        urls = [hit["url"] for hit in candidates if isinstance(hit, dict)]
+        rounds.append(urls)
+        keep = urls[:1] if len(rounds) == 1 else urls[:2]
+        return RelevanceSelection(frozenset(keep))
+
+    monkeypatch.setattr("app.orchestrator.select_relevant_hits", fake_filter)
+
+    request_id = uuid4()
+    response = Orchestrator(_config(llm_filter_enabled=True)).run(
+        request_id,
+        ExtractRequest(query="q", max_results=2, max_pages=2),
+    )
+
+    assert search_calls == [1, 2]
+    assert rounds == [
+        [
+            "https://example.com/a",
+            "https://example.com/b",
+        ],
+        ["https://example.com/a", "https://example.com/e"],
+    ]
+    assert fetch_calls == ["https://example.com/a", "https://example.com/e"]
+    assert response.counts.selected == 2
+    events = read_trace_events(trace_db, request_id)
+    assert [event for event, _ in events].count("relevance.completed") == 2
+    backfill = [
+        details for event, details in events if event == "relevance.backfill"
+    ]
+    assert backfill == [{"page": 2, "kept_count": 1, "wanted": 2}]
+
+
+def test_only_max_results_pages_are_fetched(
+    trace_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hits = [
+        _hit("https://example.com/a", "A"),
+        _hit("https://example.com/b", "B"),
+        _hit("https://example.com/c", "C"),
+        _hit("https://example.com/d", "D"),
+    ]
+    monkeypatch.setattr(
+        "app.orchestrator.fetch_search_response",
+        lambda query, *, pageno=1, timeout_s=0.0: {"results": hits},
+    )
+    fetch_calls: list[str] = []
+
+    def fake_fetch(
+        url: str, *, total_timeout_s: float | None = None
+    ) -> FetchOutcome:
+        fetch_calls.append(url)
+        return _snapshot(url)
+
+    monkeypatch.setattr("app.orchestrator.fetch_target_page", fake_fetch)
+    rounds: list[list[str]] = []
+
+    def fake_filter(
+        query: str, candidates: list[object], *, timeout_s: float = 0.0
+    ) -> RelevanceSelection:
+        urls = [hit["url"] for hit in candidates if isinstance(hit, dict)]
+        rounds.append(urls)
+        return RelevanceSelection(frozenset(urls))
+
+    monkeypatch.setattr("app.orchestrator.select_relevant_hits", fake_filter)
+
+    response = Orchestrator(_config(llm_filter_enabled=True)).run(
+        uuid4(),
+        ExtractRequest(query="q", max_results=2, max_pages=1),
+    )
+
+    assert rounds == [[
+        "https://example.com/a",
+        "https://example.com/b",
+    ]]
+    assert fetch_calls == ["https://example.com/a", "https://example.com/b"]
+    assert response.counts.selected == 2
+
+
+def test_llm_filter_is_enabled_by_configured_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.relevance.LLM_API_KEY", "test-key")
+    assert OrchestratorConfig.from_env().llm_filter_enabled is True
+
+    monkeypatch.setattr("app.relevance.LLM_API_KEY", "")
+    assert OrchestratorConfig.from_env().llm_filter_enabled is False
+
+    monkeypatch.setattr("app.relevance.LLM_API_KEY", "test-key")
+    monkeypatch.setattr("app.relevance.LLM_MODEL", "")
+    assert OrchestratorConfig.from_env().llm_filter_enabled is False

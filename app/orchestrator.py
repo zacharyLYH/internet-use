@@ -10,34 +10,30 @@ from queue import Empty, Full
 from uuid import UUID
 
 from app.cleaner import clean_to_markdown
-from app.fetcher import FetchOutcome, fetch_target_page
+from app.fetcher import fetch_target_page
 from app.pipeline import (
-    Action,
-    CleanPage,
-    Counts,
+    ExecutableAction,
     ExtractRequest,
     ExtractResponse,
-    ExtractedPage,
-    ExtractionState,
     Fail,
     FetchPage,
+    FilterHits,
     Finish,
     OrchestratorConfig,
-    PageError,
     Pause,
-    PipelineError,
     PipelineState,
-    RequestOutcome,
     SearchPage,
     Transition,
     action_started_event,
     build_response,
     clean_finished,
     fetch_finished,
+    relevance_finished,
     search_failed,
     search_succeeded,
     start_pipeline,
 )
+from app.relevance import select_relevant_hits
 from app.search import SearchError, fetch_search_response
 from app.tracer import (
     TraceError,
@@ -48,23 +44,6 @@ from app.tracer import (
 )
 
 logger = logging.getLogger(__name__)
-
-__all__ = [
-    "Counts",
-    "ExtractRequest",
-    "ExtractResponse",
-    "ExtractedPage",
-    "ExtractionState",
-    "Orchestrator",
-    "OrchestratorConfig",
-    "PageError",
-    "PipelineError",
-    "QueueExpiredError",
-    "QueueFullError",
-    "QueueStoppedError",
-    "RequestOutcome",
-    "RequestQueue",
-]
 
 
 class QueueFullError(RuntimeError):
@@ -103,30 +82,22 @@ class Orchestrator:
         while True:
             if isinstance(action, Finish):
                 result = build_response(state)
-                self._emit(
-                    request_id,
-                    (
-                        request_event(
-                            result.outcome,
-                            outcome=result.outcome,
-                            counts=result.counts.model_dump(),
-                            elapsed_ms=_elapsed_ms(started),
-                        ),
-                    ),
+                done = request_event(
+                    result.outcome,
+                    outcome=result.outcome,
+                    counts=result.counts.model_dump(),
+                    elapsed_ms=_elapsed_ms(started),
                 )
+                self._emit(request_id, (done,))
                 return result
 
             if isinstance(action, Fail):
-                self._emit(
-                    request_id,
-                    (
-                        request_event(
-                            "failed",
-                            error_code=action.error.code,
-                            elapsed_ms=_elapsed_ms(started),
-                        ),
-                    ),
+                failed = request_event(
+                    "failed",
+                    error_code=action.error.code,
+                    elapsed_ms=_elapsed_ms(started),
                 )
+                self._emit(request_id, (failed,))
                 raise action.error
 
             if isinstance(action, Pause):
@@ -134,9 +105,7 @@ class Orchestrator:
                 action = action.next_action
                 continue
 
-            started_event = action_started_event(action)
-            if started_event is not None:
-                self._emit(request_id, (started_event,))
+            self._emit(request_id, (action_started_event(state, action),))
 
             transition = self._execute(state, action)
             self._emit(request_id, transition.events)
@@ -146,18 +115,18 @@ class Orchestrator:
     def _execute(
         self,
         state: PipelineState,
-        action: SearchPage | FetchPage | CleanPage,
+        action: ExecutableAction,
     ) -> Transition:
         if isinstance(action, SearchPage):
             try:
                 search_response = fetch_search_response(
-                    (state.request.query or "").strip(),
+                    state.query_text,
                     pageno=action.page,
                     timeout_s=self._config.search_timeout_s,
                 )
             except SearchError as exc:
                 return search_failed(state, action, exc, self._config)
-            return search_succeeded(state, action, search_response)
+            return search_succeeded(state, action, search_response, self._config)
 
         if isinstance(action, FetchPage):
             outcome = fetch_target_page(
@@ -165,22 +134,26 @@ class Orchestrator:
             )
             return fetch_finished(state, action, outcome, self._config)
 
-        cleaned = clean_to_markdown(
-            action.snapshot.raw_page_html,
-            action.snapshot.final_url,
-        )
+        if isinstance(action, FilterHits):
+            selection = select_relevant_hits(
+                state.query_text,
+                state.hits,
+                timeout_s=self._config.llm_filter_timeout_s,
+            )
+            return relevance_finished(state, selection)
+
+        raw_html = action.snapshot.raw_page_html
+        cleaned = clean_to_markdown(raw_html, action.snapshot.final_url)
         return clean_finished(state, action, cleaned)
 
     def _sleep(self, pause: Pause) -> None:
         if pause.kind == "retry":
             time.sleep(self._config.retry_backoff_s * pause.attempt)
         elif self._config.page_delay_max_s > 0:
-            time.sleep(
-                random.uniform(
-                    self._config.page_delay_min_s,
-                    self._config.page_delay_max_s,
-                )
+            delay = random.uniform(
+                self._config.page_delay_min_s, self._config.page_delay_max_s
             )
+            time.sleep(delay)
 
     def _emit(self, request_id: UUID, events: tuple[TraceEvent, ...]) -> None:
         write_events(request_id, events)

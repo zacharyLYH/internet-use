@@ -7,14 +7,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.cleaner import CleanFailure, CleanOutcome
-from app.fetcher import (
-    FetchFailure,
-    FetchOutcome,
-    PageSnapshot,
-    RenderState,
-    WarningCode,
-)
+from app.fetcher import FetchOutcome, PageSnapshot, RenderState, WarningCode
+from app.linkfilter import is_low_value_url
 from app.parser import SearchHit, parse_search_response
+from app.relevance import (
+    RelevanceFailure,
+    RelevanceOutcome,
+    is_configured,
+)
 from app.search import SearchError
 from app.tracer import TraceEvent, request_event, stage_event, trace_event
 from app.urls import is_valid_http_url
@@ -36,6 +36,8 @@ class OrchestratorConfig:
     retry_backoff_s: float = 0.25
     page_delay_min_s: float = 0.5
     page_delay_max_s: float = 1.0
+    llm_filter_enabled: bool = False
+    llm_filter_timeout_s: float = 10.0
 
     def __post_init__(self) -> None:
         if self.search_timeout_s <= 0 or self.fetch_timeout_s <= 0:
@@ -48,6 +50,8 @@ class OrchestratorConfig:
             raise ValueError("page delays must be >= 0")
         if self.page_delay_min_s > self.page_delay_max_s:
             raise ValueError("page_delay_min_s must be <= page_delay_max_s")
+        if self.llm_filter_timeout_s <= 0:
+            raise ValueError("llm_filter_timeout_s must be > 0")
 
     @classmethod
     def from_env(cls) -> Self:
@@ -59,6 +63,8 @@ class OrchestratorConfig:
             retry_backoff_s=float(os.getenv("RETRY_BACKOFF_S", "0.25")),
             page_delay_min_s=float(os.getenv("PAGE_DELAY_MIN_S", "0.5")),
             page_delay_max_s=float(os.getenv("PAGE_DELAY_MAX_S", "1.0")),
+            llm_filter_enabled=is_configured(),
+            llm_filter_timeout_s=float(os.getenv("LLM_FILTER_TIMEOUT_S", "10")),
         )
 
 
@@ -118,11 +124,15 @@ class PipelineState:
     request_id: UUID
     request: ExtractRequest
     mode: Mode
-    target_url: str | None
     hits: tuple[SearchHit, ...] = ()
     seen_urls: frozenset[str] = frozenset()
     pages: tuple[ExtractedPage, ...] = ()
     next_hit: int = 0
+    searched_pages: int = 0
+
+    @property
+    def query_text(self) -> str:
+        return (self.request.query or "").strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +155,11 @@ class CleanPage:
 
 
 @dataclass(frozen=True, slots=True)
+class FilterHits:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class Pause:
     next_action: SearchPage | FetchPage
     kind: PauseKind
@@ -161,7 +176,8 @@ class Fail:
     error: PipelineError
 
 
-Action = SearchPage | FetchPage | CleanPage | Pause | Finish | Fail
+ExecutableAction = SearchPage | FetchPage | CleanPage | FilterHits
+Action = ExecutableAction | Pause | Finish | Fail
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +203,7 @@ def start_pipeline(request_id: UUID, request: ExtractRequest) -> Transition:
         details["max_results"] = request.max_results
         details["max_pages"] = request.max_pages
     events = (request_event("started", **details),)
-    state = PipelineState(
-        request_id=request_id,
-        request=request,
-        mode=mode,
-        target_url=url or None,
-    )
+    state = PipelineState(request_id=request_id, request=request, mode=mode)
 
     if mode == "query":
         return Transition(state, SearchPage(page=1, attempt=1), events)
@@ -210,8 +221,10 @@ def search_succeeded(
     state: PipelineState,
     action: SearchPage,
     response: Mapping[str, Any],
+    config: OrchestratorConfig,
 ) -> Transition:
-    result_count = _result_count(response)
+    results = response.get("results")
+    result_count = len(results) if isinstance(results, list) else 0
     events = [
         stage_event(
             "search",
@@ -229,27 +242,26 @@ def search_succeeded(
     ]
 
     try:
-        page_hits = parse_search_response(response)
+        parsed_hits = parse_search_response(response)
     except ValueError:
-        events.append(
-            stage_event(
-                "normalization",
-                "failed",
-                page=action.page,
-                error_code="normalization_failed",
-            )
+        failed = stage_event(
+            "normalization",
+            "failed",
+            page=action.page,
+            error_code="normalization_failed",
         )
-        return Transition(
-            state,
-            Fail(
-                PipelineError(
-                    "normalization_failed",
-                    "Search response could not be normalized.",
-                )
-            ),
-            tuple(events),
+        events.append(failed)
+        error = PipelineError(
+            "normalization_failed", "Search response could not be normalized."
         )
+        return Transition(state, Fail(error), tuple(events))
 
+    page_hits = [
+        hit for hit in parsed_hits if not is_low_value_url(hit["url"])
+    ]
+    low_value_count = len(parsed_hits) - len(page_hits)
+
+    limit = state.request.max_results
     hits = list(state.hits)
     seen = set(state.seen_urls)
     new_hits: list[SearchHit] = []
@@ -259,7 +271,7 @@ def search_succeeded(
         seen.add(hit["url"])
         hits.append(hit)
         new_hits.append(hit)
-        if len(hits) >= state.request.max_results:
+        if len(hits) >= limit:
             break
 
     events.append(
@@ -268,26 +280,29 @@ def search_succeeded(
             "completed",
             page=action.page,
             selected_count=len(new_hits),
+            low_value_count=low_value_count,
             selected=_hit_details(new_hits),
         )
     )
     next_state = replace(
-        state, hits=tuple(hits), seen_urls=frozenset(seen)
+        state,
+        hits=tuple(hits),
+        seen_urls=frozenset(seen),
+        searched_pages=action.page,
     )
 
-    if (
-        not new_hits
-        or len(hits) >= state.request.max_results
-        or action.page >= state.request.max_pages
-    ):
-        return Transition(next_state, _next_page(next_state), tuple(events))
-
-    next_search = SearchPage(page=action.page + 1, attempt=1)
-    return Transition(
-        next_state,
-        Pause(next_search, kind="page"),
-        tuple(events),
-    )
+    if not new_hits:
+        return Transition(next_state, _next_fetch(next_state), tuple(events))
+    if len(hits) < limit and action.page < state.request.max_pages:
+        next_search = SearchPage(page=action.page + 1, attempt=1)
+        return Transition(
+            next_state,
+            Pause(next_search, kind="page"),
+            tuple(events),
+        )
+    if config.llm_filter_enabled and len(next_state.hits) > 1:
+        return Transition(next_state, FilterHits(), tuple(events))
+    return Transition(next_state, _next_fetch(next_state), tuple(events))
 
 
 def search_failed(
@@ -307,27 +322,18 @@ def search_failed(
         )
     ]
     if error.retryable and action.attempt < config.search_retries + 1:
-        events.append(
-            trace_event(
-                "retry.scheduled",
-                stage="search",
-                page=action.page,
-                attempt=action.attempt + 1,
-            )
+        retry = trace_event(
+            "retry.scheduled",
+            stage="search",
+            page=action.page,
+            attempt=action.attempt + 1,
         )
-        next_search = SearchPage(
-            page=action.page, attempt=action.attempt + 1
-        )
-        return Transition(
-            state,
-            Pause(next_search, kind="retry", attempt=action.attempt),
-            tuple(events),
-        )
-    return Transition(
-        state,
-        Fail(PipelineError("search_failed", "Search request failed.")),
-        tuple(events),
-    )
+        events.append(retry)
+        next_search = SearchPage(page=action.page, attempt=action.attempt + 1)
+        pause = Pause(next_search, kind="retry", attempt=action.attempt)
+        return Transition(state, pause, tuple(events))
+    failure = PipelineError("search_failed", "Search request failed.")
+    return Transition(state, Fail(failure), tuple(events))
 
 
 def fetch_finished(
@@ -336,16 +342,12 @@ def fetch_finished(
     outcome: FetchOutcome,
     config: OrchestratorConfig,
 ) -> Transition:
-    phase = (
-        "completed" if isinstance(outcome, PageSnapshot) else "failed"
-    )
-    events = [
-        stage_event(
-            "fetch",
-            phase,
-            **_fetch_details(outcome, action.ordinal, action.attempt),
-        )
-    ]
+    if isinstance(outcome, PageSnapshot):
+        phase = "completed"
+    else:
+        phase = "failed"
+    details = _fetch_details(outcome, action.ordinal, action.attempt)
+    events = [stage_event("fetch", phase, **details)]
 
     if isinstance(outcome, PageSnapshot):
         return Transition(
@@ -354,24 +356,16 @@ def fetch_finished(
 
     retryable = outcome.error_code in RETRYABLE_FETCH
     if retryable and action.attempt < config.fetch_retries + 1:
-        events.append(
-            trace_event(
-                "retry.scheduled",
-                stage="fetch",
-                ordinal=action.ordinal,
-                attempt=action.attempt + 1,
-            )
-        )
-        next_fetch = FetchPage(
-            url=action.url,
+        retry = trace_event(
+            "retry.scheduled",
+            stage="fetch",
             ordinal=action.ordinal,
             attempt=action.attempt + 1,
         )
-        return Transition(
-            state,
-            Pause(next_fetch, kind="retry", attempt=action.attempt),
-            tuple(events),
-        )
+        events.append(retry)
+        next_fetch = FetchPage(action.url, action.ordinal, action.attempt + 1)
+        pause = Pause(next_fetch, kind="retry", attempt=action.attempt)
+        return Transition(state, pause, tuple(events))
 
     page = ExtractedPage(
         requested_url=outcome.requested_url,
@@ -380,7 +374,7 @@ def fetch_finished(
         error=PageError(code=outcome.error_code, message=outcome.message),
     )
     next_state = _page_finished(state, page)
-    return Transition(next_state, _next_page(next_state), tuple(events))
+    return Transition(next_state, _next_fetch(next_state), tuple(events))
 
 
 def clean_finished(
@@ -421,10 +415,61 @@ def clean_finished(
         page.markdown = outcome.markdown_content
 
     next_state = _page_finished(state, page)
-    return Transition(next_state, _next_page(next_state), (event,))
+    return Transition(next_state, _next_fetch(next_state), (event,))
 
 
-def action_started_event(action: Action) -> TraceEvent | None:
+def relevance_finished(
+    state: PipelineState, outcome: RelevanceOutcome
+) -> Transition:
+    candidate_count = len(state.hits)
+    if isinstance(outcome, RelevanceFailure):
+        event = stage_event(
+            "relevance",
+            "failed",
+            candidate_count=candidate_count,
+            error_code=outcome.error_code,
+        )
+        return Transition(state, _next_fetch(state), (event,))
+
+    kept = [hit for hit in state.hits if hit["url"] in outcome.keep]
+    dropped = [hit for hit in state.hits if hit["url"] not in outcome.keep]
+    next_state = replace(state, hits=tuple(kept))
+    events = [
+        stage_event(
+            "relevance",
+            "completed",
+            candidate_count=candidate_count,
+            kept_count=len(kept),
+            dropped_count=len(dropped),
+            kept=[hit["url"] for hit in kept],
+            dropped=[hit["url"] for hit in dropped],
+        )
+    ]
+
+    if (
+        len(kept) < state.request.max_results
+        and state.searched_pages < state.request.max_pages
+    ):
+        page = state.searched_pages + 1
+        events.append(
+            trace_event(
+                "relevance.backfill",
+                page=page,
+                kept_count=len(kept),
+                wanted=state.request.max_results,
+            )
+        )
+        return Transition(
+            next_state,
+            Pause(SearchPage(page=page, attempt=1), kind="page"),
+            tuple(events),
+        )
+    return Transition(next_state, _next_fetch(next_state), tuple(events))
+
+
+def action_started_event(
+    state: PipelineState, action: ExecutableAction
+) -> TraceEvent:
     if isinstance(action, SearchPage):
         return stage_event(
             "search", "started", page=action.page, attempt=action.attempt
@@ -444,7 +489,9 @@ def action_started_event(action: Action) -> TraceEvent | None:
             ordinal=action.ordinal,
             url=action.snapshot.final_url,
         )
-    return None
+    return stage_event(
+        "relevance", "started", candidate_count=len(state.hits)
+    )
 
 
 def build_response(state: PipelineState) -> ExtractResponse:
@@ -461,10 +508,11 @@ def build_response(state: PipelineState) -> ExtractResponse:
     )
 
 
-def _next_page(state: PipelineState) -> FetchPage | Finish:
+def _next_fetch(state: PipelineState) -> FetchPage | Finish:
+    """Next page to fetch, capped at max_results."""
     if state.mode == "url":
         return Finish()
-    if state.next_hit >= len(state.hits):
+    if state.next_hit >= min(len(state.hits), state.request.max_results):
         return Finish()
     hit = state.hits[state.next_hit]
     return FetchPage(
@@ -482,11 +530,6 @@ def _page_finished(
         pages=state.pages + (page,),
         next_hit=state.next_hit + 1,
     )
-
-
-def _result_count(response: Mapping[str, Any]) -> int:
-    results = response.get("results")
-    return len(results) if isinstance(results, list) else 0
 
 
 def _hit_details(hits: Sequence[SearchHit]) -> list[dict[str, object]]:
@@ -512,22 +555,14 @@ def _fetch_details(
         "warnings": list(outcome.warnings),
     }
     if isinstance(outcome, PageSnapshot):
-        details.update(
-            {
-                "final_url": outcome.final_url,
-                "status_code": outcome.status_code,
-                "content_type": outcome.content_type,
-                "render_state": outcome.render_state,
-                "html_bytes": len(outcome.raw_page_html.encode("utf-8")),
-            }
-        )
+        details["final_url"] = outcome.final_url
+        details["status_code"] = outcome.status_code
+        details["content_type"] = outcome.content_type
+        details["render_state"] = outcome.render_state
+        details["html_bytes"] = len(outcome.raw_page_html.encode("utf-8"))
     else:
-        details.update(
-            {
-                "error_code": outcome.error_code,
-                "message": outcome.message,
-            }
-        )
+        details["error_code"] = outcome.error_code
+        details["message"] = outcome.message
     return details
 
 
