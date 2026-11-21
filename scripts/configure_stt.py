@@ -1,0 +1,205 @@
+"""Prompt for the optional OpenAI-compatible STT used for video/audio pages.
+
+Writes `data/stt.env`, which `make start` sources. Transcription turns on when
+an endpoint, model, and key are all present. Leaving the API key blank keeps
+the default behavior: allowlisted media pages are scraped for their
+description only, with no audio download.
+"""
+
+from __future__ import annotations
+
+import getpass
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL = "whisper-1"
+DEFAULT_ENV_FILE = "data/stt.env"
+TRUE_FLAGS = frozenset({"1", "true", "yes", "on"})
+
+
+def main() -> None:
+    env_file = Path(os.environ.get("STT_ENV_FILE", DEFAULT_ENV_FILE))
+    force = os.environ.get("STT_CONFIGURE", "").strip().lower() in TRUE_FLAGS
+    current = _read_env(env_file)
+
+    if not force and os.environ.get("STT_API_KEY"):
+        print("Media transcription: using STT_API_KEY from the environment.")
+        return
+    if not force and current.get("STT_API_KEY"):
+        print(
+            "Media transcription: enabled"
+            f" ({current.get('STT_MODEL', DEFAULT_MODEL)}"
+            f" at {current.get('STT_BASE_URL', DEFAULT_BASE_URL)})."
+        )
+        print(f"  Reconfigure with `make stt-config` or delete {env_file}.")
+        return
+    if not force and env_file.exists():
+        print(
+            "Media transcription: disabled (no API key in"
+            f" {env_file}). Run `make stt-config` to enable it."
+        )
+        return
+    if not sys.stdin.isatty():
+        print(
+            "Media transcription: no interactive terminal,"
+            f" leaving {env_file} unchanged."
+        )
+        return
+
+    print("Optional STT for allowlisted video/audio pages (OpenAI-compatible).")
+    print("Audio is downloaded with yt-dlp, converted with ffmpeg, and sent")
+    print("to /audio/transcriptions. Existing subtitles are used first.")
+    print("Press Enter to accept a default. Leave the API key blank to skip it.")
+
+    base_url = _ask_url(
+        current.get("STT_BASE_URL")
+        or os.environ.get("STT_BASE_URL")
+        or DEFAULT_BASE_URL
+    )
+    if base_url is None:
+        _write_disabled(env_file)
+        return
+    model = (
+        _ask(
+            "  Model",
+            current.get("STT_MODEL")
+            or os.environ.get("STT_MODEL")
+            or DEFAULT_MODEL,
+        ).strip()
+        or DEFAULT_MODEL
+    )
+    language = _ask(
+        "  Language (optional, e.g. en)",
+        current.get("STT_LANGUAGE") or os.environ.get("STT_LANGUAGE", ""),
+    ).strip()
+    api_key = _ask_secret("  API key").strip()
+    if not api_key:
+        _write_disabled(
+            env_file, base_url=base_url, model=model, language=language
+        )
+        return
+    _write_enabled(
+        env_file,
+        base_url=base_url,
+        model=model,
+        language=language,
+        api_key=api_key,
+    )
+
+
+def _ask_url(default: str) -> str | None:
+    for _ in range(3):
+        value = _ask("  Endpoint", default).strip()
+        if not value:
+            return default
+        parsed = urlsplit(value)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return value.rstrip("/")
+        print(f"  Endpoint must be an http(s) URL, for example {DEFAULT_BASE_URL}")
+    print("Media transcription: invalid endpoint, keeping the current behavior.")
+    return None
+
+
+def _ask(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{label}{suffix}: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(1)
+    return answer.strip() or default
+
+
+def _ask_secret(label: str) -> str:
+    try:
+        return getpass.getpass(f"{label}: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(1)
+    except Exception:
+        return _ask(label)
+
+
+def _write_enabled(
+    env_file: Path,
+    *,
+    base_url: str,
+    model: str,
+    language: str,
+    api_key: str,
+) -> None:
+    values = {
+        "STT_BASE_URL": base_url,
+        "STT_MODEL": model,
+        "STT_API_KEY": api_key,
+        "STT_TIMEOUT_S": "300",
+    }
+    if language:
+        values["STT_LANGUAGE"] = language
+    _write_env(env_file, values)
+    print(f"Media transcription: enabled with {model} at {base_url}.")
+
+
+def _write_disabled(
+    env_file: Path,
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+    language: str | None = None,
+) -> None:
+    values: dict[str, str] = {}
+    if base_url:
+        values["STT_BASE_URL"] = base_url
+    if model:
+        values["STT_MODEL"] = model
+    if language:
+        values["STT_LANGUAGE"] = language
+    _write_env(env_file, values)
+    print("Media transcription: disabled; media pages return descriptions only.")
+
+
+def _write_env(env_file: Path, values: dict[str, str]) -> None:
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Generated by `make stt-config`.",
+        "# Transcription is on only when STT_BASE_URL, STT_MODEL, and",
+        "# STT_API_KEY are all set. Delete this file to be asked again.",
+        *(f"{key}={_quote(value)}" for key, value in values.items()),
+    ]
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    env_file.chmod(0o600)
+
+
+def _read_env(env_file: Path) -> dict[str, str]:
+    try:
+        text = env_file.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, raw = stripped.partition("=")
+        values[key.strip()] = _unquote(raw.strip())
+    return values
+
+
+def _quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("'\\''", "'")
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+if __name__ == "__main__":
+    main()
+

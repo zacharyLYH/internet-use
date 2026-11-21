@@ -13,6 +13,8 @@ dependencies = [
     "beautifulsoup4",
     "trafilatura",
     "patchright",
+    "yt-dlp",
+    "python-multipart",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +23,10 @@ dev = ["mypy", "openai", "pytest"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["yt_dlp", "yt_dlp.*"]
+ignore_missing_imports = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

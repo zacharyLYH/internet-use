@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Self
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import RequestResponseEndpoint
 
+from app import stt
 from app.auth import is_authorized, load_api_keys
 from app.fetcher import shutdown_fetcher
 from app.orchestrator import (
@@ -43,6 +45,7 @@ class AppSettings:
     queue_max_size: int = 100
     queue_wait_s: float = 30.0
     max_request_bytes: int = 1_000_000
+    max_audio_bytes: int = 25_000_000
 
     def __post_init__(self) -> None:
         if self.queue_max_size < 1:
@@ -51,6 +54,8 @@ class AppSettings:
             raise ValueError("queue_wait_s must be > 0")
         if self.max_request_bytes < 1:
             raise ValueError("max_request_bytes must be >= 1")
+        if self.max_audio_bytes < 1:
+            raise ValueError("max_audio_bytes must be >= 1")
 
     @classmethod
     def from_env(cls) -> Self:
@@ -62,6 +67,7 @@ class AppSettings:
             queue_max_size=int(os.getenv("QUEUE_MAX_SIZE", "100")),
             queue_wait_s=float(os.getenv("QUEUE_WAIT_S", "30")),
             max_request_bytes=int(os.getenv("MAX_REQUEST_BYTES", "1000000")),
+            max_audio_bytes=int(os.getenv("MAX_AUDIO_BYTES", "25000000")),
         )
 
 
@@ -98,6 +104,10 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     max_results: int | None = Field(default=None, ge=1, le=20)
     max_pages: int | None = Field(default=None, ge=1, le=10)
+
+
+class TranscriptionResponse(BaseModel):
+    text: str
 
 
 def create_app(
@@ -156,8 +166,13 @@ def create_app(
 
         length_header = request.headers.get("content-length")
         if length_header is not None:
+            limit = (
+                resolved.max_audio_bytes
+                if request.url.path == "/v1/audio/transcriptions"
+                else resolved.max_request_bytes
+            )
             try:
-                too_large = int(length_header) > resolved.max_request_bytes
+                too_large = int(length_header) > limit
             except ValueError:
                 too_large = False
             if too_large:
@@ -232,7 +247,76 @@ def create_app(
     ) -> ExtractResponse:
         return _submit(request, _extract_request_from_chat(payload))
 
+    @app.post("/v1/extract", response_model=ExtractResponse)
+    def extract(payload: ExtractRequest, request: Request) -> ExtractResponse:
+        return _submit(request, payload)
+
+    @app.post(
+        "/v1/audio/transcriptions", response_model=TranscriptionResponse
+    )
+    def audio_transcriptions(
+        request: Request,
+        file: UploadFile = File(...),
+        model: str | None = Form(default=None),
+        language: str | None = Form(default=None),
+        response_format: str | None = Form(default=None),
+    ) -> TranscriptionResponse:
+        return _transcribe_upload(
+            request,
+            file,
+            language=language or config.stt_language or None,
+            response_format=response_format,
+            timeout_s=config.stt_timeout_s,
+        )
+
     return app
+
+
+def _transcribe_upload(
+    request: Request,
+    upload: UploadFile,
+    *,
+    language: str | None,
+    response_format: str | None,
+    timeout_s: float,
+) -> TranscriptionResponse:
+    if response_format not in (None, "", "json"):
+        raise ApiError(
+            400, "invalid_request", "Only response_format=json is supported."
+        )
+    if not stt.is_configured():
+        raise ApiError(
+            503, "stt_not_configured", "STT endpoint is not configured."
+        )
+    settings: AppSettings = request.app.state.settings
+    data = upload.file.read(settings.max_audio_bytes + 1)
+    if not data:
+        raise ApiError(400, "invalid_request", "Audio file is empty.")
+    if len(data) > settings.max_audio_bytes:
+        raise ApiError(413, "request_too_large", "Audio file is too large.")
+
+    suffix = Path(upload.filename or "").suffix.lower() or ".mp3"
+    with tempfile.TemporaryDirectory(prefix="internet-use-stt-") as tmp:
+        path = Path(tmp) / f"upload{suffix}"
+        path.write_bytes(data)
+        outcome = stt.transcribe_audio(
+            path,
+            timeout_s=timeout_s,
+            language_hint=language or None,
+        )
+
+    if isinstance(outcome, stt.TranscriptionSuccess):
+        return TranscriptionResponse(text=outcome.text)
+    if outcome.error_code == "stt_empty_transcript":
+        return TranscriptionResponse(text="")
+    if outcome.error_code == "stt_not_configured":
+        raise ApiError(503, "stt_not_configured", outcome.message)
+    code = (
+        "upstream_stt_failed"
+        if outcome.error_code == "stt_request_failed"
+        else "upstream_stt_invalid_response"
+    )
+    raise ApiError(502, code, outcome.message)
 
 
 def _submit(request: Request, payload: ExtractRequest) -> ExtractResponse:

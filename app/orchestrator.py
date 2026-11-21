@@ -11,6 +11,7 @@ from uuid import UUID
 
 from app.cleaner import clean_to_markdown
 from app.fetcher import fetch_target_page
+from app.media import transcribe_media
 from app.pipeline import (
     ExecutableAction,
     ExtractRequest,
@@ -23,11 +24,13 @@ from app.pipeline import (
     Pause,
     PipelineState,
     SearchPage,
+    TranscribeMedia,
     Transition,
     action_started_event,
     build_response,
     clean_finished,
     fetch_finished,
+    media_finished,
     relevance_finished,
     search_failed,
     search_succeeded,
@@ -74,7 +77,7 @@ class Orchestrator:
 
     def run(self, request_id: UUID, request: ExtractRequest) -> ExtractResponse:
         started = time.monotonic()
-        transition = start_pipeline(request_id, request)
+        transition = start_pipeline(request_id, request, self._config)
         self._emit(request_id, transition.events)
         state = transition.state
         action = transition.action
@@ -141,6 +144,15 @@ class Orchestrator:
                 timeout_s=self._config.llm_filter_timeout_s,
             )
             return relevance_finished(state, selection)
+
+        if isinstance(action, TranscribeMedia):
+            media_outcome = transcribe_media(
+                action.url,
+                max_duration_s=self._config.media_duration_max_s,
+                timeout_s=self._config.media_timeout_s,
+                language_hint=self._config.stt_language or None,
+            )
+            return media_finished(state, action, media_outcome)
 
         raw_html = action.snapshot.raw_page_html
         cleaned = clean_to_markdown(raw_html, action.snapshot.final_url)

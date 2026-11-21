@@ -8,5 +8,6 @@ uvicorn.pid
 data/browser-profile/
 data/api_keys.txt
 data/llm.env
+data/stt.env
 data/traces.sqlite3*
 data/test-runs/

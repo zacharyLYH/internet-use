@@ -9,6 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.cleaner import CleanFailure, CleanOutcome
 from app.fetcher import FetchOutcome, PageSnapshot, RenderState, WarningCode
 from app.linkfilter import is_low_value_url
+from app.media import (
+    MediaFailure,
+    MediaOutcome,
+    MediaSuccess,
+    TranscriptSource,
+    TranscriptState,
+    is_media_url,
+)
 from app.parser import SearchHit, parse_search_response
 from app.relevance import (
     RelevanceFailure,
@@ -16,6 +24,7 @@ from app.relevance import (
     is_configured,
 )
 from app.search import SearchError
+from app.stt import is_configured as stt_is_configured
 from app.tracer import TraceEvent, request_event, stage_event, trace_event
 from app.urls import is_valid_http_url
 
@@ -38,6 +47,11 @@ class OrchestratorConfig:
     page_delay_max_s: float = 1.0
     llm_filter_enabled: bool = False
     llm_filter_timeout_s: float = 10.0
+    stt_enabled: bool = False
+    stt_timeout_s: float = 300.0
+    stt_language: str = ""
+    media_timeout_s: float = 120.0
+    media_duration_max_s: int = 1200
 
     def __post_init__(self) -> None:
         if self.search_timeout_s <= 0 or self.fetch_timeout_s <= 0:
@@ -52,6 +66,10 @@ class OrchestratorConfig:
             raise ValueError("page_delay_min_s must be <= page_delay_max_s")
         if self.llm_filter_timeout_s <= 0:
             raise ValueError("llm_filter_timeout_s must be > 0")
+        if self.stt_timeout_s <= 0 or self.media_timeout_s <= 0:
+            raise ValueError("stt_timeout_s and media_timeout_s must be > 0")
+        if self.media_duration_max_s < 1:
+            raise ValueError("media_duration_max_s must be >= 1")
 
     @classmethod
     def from_env(cls) -> Self:
@@ -65,6 +83,11 @@ class OrchestratorConfig:
             page_delay_max_s=float(os.getenv("PAGE_DELAY_MAX_S", "1.0")),
             llm_filter_enabled=is_configured(),
             llm_filter_timeout_s=float(os.getenv("LLM_FILTER_TIMEOUT_S", "10")),
+            stt_enabled=stt_is_configured(),
+            stt_timeout_s=float(os.getenv("STT_TIMEOUT_S", "300")),
+            stt_language=os.getenv("STT_LANGUAGE", "").strip(),
+            media_timeout_s=float(os.getenv("MEDIA_TIMEOUT_S", "120")),
+            media_duration_max_s=int(os.getenv("MAX_MEDIA_DURATION_S", "1200")),
         )
 
 
@@ -82,6 +105,15 @@ class PageError(BaseModel):
     message: str
 
 
+class MediaDetails(BaseModel):
+    platform: str | None = None
+    duration_s: int | None = None
+    transcript_source: TranscriptSource = "none"
+    transcript_state: TranscriptState = "unavailable"
+    transcript_chars: int = 0
+    error_code: str | None = None
+
+
 class ExtractedPage(BaseModel):
     requested_url: str
     final_url: str | None = None
@@ -92,6 +124,7 @@ class ExtractedPage(BaseModel):
     warnings: list[WarningCode] = Field(default_factory=list)
     extraction_state: ExtractionState = "not_attempted"
     markdown: str = ""
+    media: MediaDetails | None = None
     error: PageError | None = None
 
 
@@ -102,6 +135,7 @@ class Counts(BaseModel):
     empty: int = 0
     failed: int = 0
     not_attempted: int = 0
+    transcribed: int = 0
 
 
 class ExtractResponse(BaseModel):
@@ -129,6 +163,7 @@ class PipelineState:
     pages: tuple[ExtractedPage, ...] = ()
     next_hit: int = 0
     searched_pages: int = 0
+    media_enabled: bool = False
 
     @property
     def query_text(self) -> str:
@@ -155,6 +190,12 @@ class CleanPage:
 
 
 @dataclass(frozen=True, slots=True)
+class TranscribeMedia:
+    url: str
+    ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
 class FilterHits:
     pass
 
@@ -176,7 +217,7 @@ class Fail:
     error: PipelineError
 
 
-ExecutableAction = SearchPage | FetchPage | CleanPage | FilterHits
+ExecutableAction = SearchPage | FetchPage | CleanPage | FilterHits | TranscribeMedia
 Action = ExecutableAction | Pause | Finish | Fail
 
 
@@ -187,7 +228,11 @@ class Transition:
     events: tuple[TraceEvent, ...] = ()
 
 
-def start_pipeline(request_id: UUID, request: ExtractRequest) -> Transition:
+def start_pipeline(
+    request_id: UUID,
+    request: ExtractRequest,
+    config: OrchestratorConfig | None = None,
+) -> Transition:
     query = (request.query or "").strip()
     url = (request.url or "").strip()
     if bool(query) == bool(url):
@@ -203,7 +248,13 @@ def start_pipeline(request_id: UUID, request: ExtractRequest) -> Transition:
         details["max_results"] = request.max_results
         details["max_pages"] = request.max_pages
     events = (request_event("started", **details),)
-    state = PipelineState(request_id=request_id, request=request, mode=mode)
+    media_enabled = bool(config and config.stt_enabled)
+    state = PipelineState(
+        request_id=request_id,
+        request=request,
+        mode=mode,
+        media_enabled=media_enabled,
+    )
 
     if mode == "query":
         return Transition(state, SearchPage(page=1, attempt=1), events)
@@ -214,7 +265,7 @@ def start_pipeline(request_id: UUID, request: ExtractRequest) -> Transition:
             400,
         )
         return Transition(state, Fail(error), events)
-    return Transition(state, FetchPage(url, ordinal=1, attempt=1), events)
+    return Transition(state, _next_action(state, url, 1), events)
 
 
 def search_succeeded(
@@ -418,6 +469,100 @@ def clean_finished(
     return Transition(next_state, _next_fetch(next_state), (event,))
 
 
+def media_finished(
+    state: PipelineState, action: TranscribeMedia, outcome: MediaOutcome
+) -> Transition:
+    if isinstance(outcome, MediaFailure):
+        event = stage_event(
+            "media",
+            "failed",
+            ordinal=action.ordinal,
+            url=action.url,
+            error_code=outcome.error_code,
+        )
+        page = ExtractedPage(
+            requested_url=outcome.requested_url,
+            extraction_state="failed",
+            media=MediaDetails(
+                transcript_state="failed", error_code=outcome.error_code
+            ),
+            error=PageError(
+                code=outcome.error_code, message=outcome.error_message
+            ),
+        )
+    else:
+        metadata = outcome.metadata
+        markdown = _media_markdown(
+            metadata.title,
+            metadata.description,
+            metadata.uploader,
+            metadata.duration_s,
+            metadata.platform,
+            outcome.transcript,
+        )
+        event = stage_event(
+            "media",
+            "completed",
+            ordinal=action.ordinal,
+            url=metadata.final_url,
+            duration_s=metadata.duration_s,
+            transcript_source=outcome.transcript_source,
+            transcript_state=outcome.transcript_state,
+            transcript_chars=len(outcome.transcript),
+            error_code=outcome.error_code,
+        )
+        page = ExtractedPage(
+            requested_url=metadata.requested_url,
+            final_url=metadata.final_url,
+            title=metadata.title or None,
+            extraction_state="extracted" if markdown else "empty",
+            markdown=markdown,
+            media=MediaDetails(
+                platform=metadata.platform,
+                duration_s=metadata.duration_s,
+                transcript_source=outcome.transcript_source,
+                transcript_state=outcome.transcript_state,
+                transcript_chars=len(outcome.transcript),
+                error_code=outcome.error_code,
+            ),
+        )
+
+    next_state = _page_finished(state, page)
+    return Transition(next_state, _next_fetch(next_state), (event,))
+
+
+def _media_markdown(
+    title: str,
+    description: str,
+    uploader: str | None,
+    duration_s: int | None,
+    platform: str | None,
+    transcript: str,
+) -> str:
+    lines: list[str] = []
+    if title:
+        lines.append(f"# {title}")
+    facts = [uploader, _format_duration(duration_s), platform]
+    fact_line = " · ".join(fact for fact in facts if fact)
+    if fact_line:
+        lines.extend(("", fact_line))
+    if description:
+        lines.extend(("", description.strip()))
+    if transcript:
+        lines.extend(("", "## Transcript", "", transcript))
+    return "\n".join(lines).strip()
+
+
+def _format_duration(seconds: int | None) -> str | None:
+    if seconds is None or seconds < 0:
+        return None
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def relevance_finished(
     state: PipelineState, outcome: RelevanceOutcome
 ) -> Transition:
@@ -489,6 +634,13 @@ def action_started_event(
             ordinal=action.ordinal,
             url=action.snapshot.final_url,
         )
+    if isinstance(action, TranscribeMedia):
+        return stage_event(
+            "media",
+            "started",
+            ordinal=action.ordinal,
+            url=action.url,
+        )
     return stage_event(
         "relevance", "started", candidate_count=len(state.hits)
     )
@@ -508,18 +660,25 @@ def build_response(state: PipelineState) -> ExtractResponse:
     )
 
 
-def _next_fetch(state: PipelineState) -> FetchPage | Finish:
+def _next_fetch(
+    state: PipelineState,
+) -> FetchPage | TranscribeMedia | Finish:
     """Next page to fetch, capped at max_results."""
     if state.mode == "url":
         return Finish()
     if state.next_hit >= min(len(state.hits), state.request.max_results):
         return Finish()
     hit = state.hits[state.next_hit]
-    return FetchPage(
-        url=hit["url"],
-        ordinal=state.next_hit + 1,
-        attempt=1,
-    )
+    return _next_action(state, hit["url"], state.next_hit + 1)
+
+
+def _next_action(
+    state: PipelineState, url: str, ordinal: int
+) -> FetchPage | TranscribeMedia:
+    """Transcribe allowlisted media when STT is on, otherwise scrape."""
+    if state.media_enabled and is_media_url(url):
+        return TranscribeMedia(url, ordinal)
+    return FetchPage(url=url, ordinal=ordinal, attempt=1)
 
 
 def _page_finished(
@@ -575,5 +734,10 @@ def _counts(pages: Sequence[ExtractedPage]) -> Counts:
         failed=sum(page.extraction_state == "failed" for page in pages),
         not_attempted=sum(
             page.extraction_state == "not_attempted" for page in pages
+        ),
+        transcribed=sum(
+            page.media is not None
+            and page.media.transcript_state == "extracted"
+            for page in pages
         ),
     )

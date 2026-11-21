@@ -232,6 +232,7 @@ def test_direct_article_end_to_end(
         "empty": 0,
         "failed": 0,
         "not_attempted": 0,
+        "transcribed": 0,
     }
     page = body["pages"][0]
     assert page["status_code"] == 200
