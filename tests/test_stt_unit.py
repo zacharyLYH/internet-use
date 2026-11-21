@@ -127,6 +127,7 @@ def test_http_error_returns_request_failed(
     assert isinstance(outcome, stt.TranscriptionFailure)
     assert outcome.error_code == "stt_request_failed"
     assert "bad audio" in outcome.message
+    assert "https://stt.test/v1/audio/transcriptions" in outcome.message
 
 
 def test_transport_error_returns_request_failed(

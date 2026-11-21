@@ -112,6 +112,7 @@ class MediaDetails(BaseModel):
     transcript_state: TranscriptState = "unavailable"
     transcript_chars: int = 0
     error_code: str | None = None
+    error_message: str | None = None
 
 
 class ExtractedPage(BaseModel):
@@ -479,12 +480,15 @@ def media_finished(
             ordinal=action.ordinal,
             url=action.url,
             error_code=outcome.error_code,
+            error_message=outcome.error_message,
         )
         page = ExtractedPage(
             requested_url=outcome.requested_url,
             extraction_state="failed",
             media=MediaDetails(
-                transcript_state="failed", error_code=outcome.error_code
+                transcript_state="failed",
+                error_code=outcome.error_code,
+                error_message=outcome.error_message,
             ),
             error=PageError(
                 code=outcome.error_code, message=outcome.error_message
@@ -510,6 +514,7 @@ def media_finished(
             transcript_state=outcome.transcript_state,
             transcript_chars=len(outcome.transcript),
             error_code=outcome.error_code,
+            error_message=outcome.error_message,
         )
         page = ExtractedPage(
             requested_url=metadata.requested_url,
@@ -524,6 +529,7 @@ def media_finished(
                 transcript_state=outcome.transcript_state,
                 transcript_chars=len(outcome.transcript),
                 error_code=outcome.error_code,
+                error_message=outcome.error_message,
             ),
         )
 

@@ -430,6 +430,8 @@ def test_media_finished_records_failure() -> None:
     assert page.extraction_state == "failed"
     assert page.error is not None
     assert page.error.code == "media_unavailable"
+    assert page.media is not None
+    assert page.media.error_message == "gone"
     assert build_response(finished.state).outcome == "completed_with_errors"
 
 

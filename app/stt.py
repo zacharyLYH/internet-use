@@ -111,12 +111,17 @@ def transcribe_audio(
         text = _transcript_text(response)
     except httpx.HTTPStatusError as exc:
         detail = _error_detail(exc.response)
+        request_url = f"{STT_BASE_URL}/audio/transcriptions"
         logger.warning(
-            "stt request failed status=%s detail=%s",
+            "stt request failed url=%s status=%s detail=%s",
+            request_url,
             exc.response.status_code,
             detail,
         )
-        message = f"STT request failed with status {exc.response.status_code}."
+        message = (
+            f"STT request failed with status {exc.response.status_code}"
+            f" for {request_url}."
+        )
         if detail:
             message = f"{message} {detail}"
         return TranscriptionFailure("stt_request_failed", message)
